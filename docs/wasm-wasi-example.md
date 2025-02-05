@@ -9,8 +9,16 @@
 ...
 ```
 
+
 ## Examples
-#### Compile and run `wasm` modules directly
+
+#### Try out example with pre-built image and podman.
+
+```console
+podman run -it -p 8080:8080  --name=wasm-example  --platform=wasi/wasm32   michaelirwin244/wasm-example
+```
+
+#### Compiling and running `wasm` modules
 * Following example is using `rust` to compile a webassembly module but you can use any supported language.
 * Create a new rust binary using `cargo new hello_wasm --bin`.
 * Add relevant function to `src/main.rs` for this example we will be using a print.
@@ -19,7 +27,7 @@
    println!("{}", "This is from a main function from a wasm module");
   }
 ```
-* Compile to `wasm32-wasi` target using `wasm-pack` or any other relevant tool. We are going to be using `cargo build --target wasm32-wasi`
+* Compile to `wasm32-wasip1` target using `wasm-pack` or any other relevant tool. We are going to be using `cargo build --target wasm32-wasip2`
 * Create relevant image and use your container manager. But for this example we will be running directly using crun and plub config manually.
 ```console
 $ crun run wasm-container
@@ -34,9 +42,9 @@ This is from a main function from a wasm module
 COPY hello.wasm /
 CMD ["/hello.wasm"]
  ```
-* Build wasm image using buildah with annotation `module.wasm.image/variant=compat`
+* Build wasm image using buildah
 ```console
-$ buildah build --annotation "module.wasm.image/variant=compat" -t mywasm-image .
+$ buildah build --platform=wasi/wasm -t mywasm-image .
 ```
 * Make sure your podman points to oci runtime `crun` build with `wasm` support.
 * Run image using podman

@@ -25,6 +25,10 @@
 #  define CGROUP_ROOT "/sys/fs/cgroup"
 #endif
 
+#ifndef PROC_SELF_CGROUP
+#  define PROC_SELF_CGROUP "/proc/self/cgroup"
+#endif
+
 enum
 {
   CGROUP_MODE_UNIFIED = 1,
@@ -51,9 +55,13 @@ struct libcrun_cgroup_args
   uid_t root_uid;
   gid_t root_gid;
   const char *id;
+  bool joined;
+
+  const char *state_root;
 };
 
 /* cgroup life-cycle management.  */
+int libcrun_cgroup_preenter (struct libcrun_cgroup_args *args, int *dirfd, libcrun_error_t *err);
 int libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status **out, libcrun_error_t *err);
 int libcrun_cgroup_enter_finalize (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
 int libcrun_cgroup_destroy (struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
@@ -83,6 +91,7 @@ int libcrun_cgroup_has_oom (struct libcrun_cgroup_status *status, libcrun_error_
 int libcrun_cgroup_read_pids (struct libcrun_cgroup_status *status, bool recurse, pid_t **pids, libcrun_error_t *err);
 
 int libcrun_update_cgroup_resources (struct libcrun_cgroup_status *status,
+                                     const char *state_root,
                                      runtime_spec_schema_config_linux_resources *resources,
                                      libcrun_error_t *err);
 

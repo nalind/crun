@@ -33,52 +33,67 @@
 #include <inttypes.h>
 #include <time.h>
 
+#include <sched.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <libgen.h>
 
 static int
-initialize_cpuset_subsystem_rec (char *path, size_t path_len, char *cpus, char *mems, libcrun_error_t *err)
+initialize_cpuset_subsystem_rec (char *path, size_t path_len, char *cpus, char *mems, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
 {
+  cleanup_free char *allocated_cpus = NULL;
+  cleanup_free char *allocated_mems = NULL;
   cleanup_close int dirfd = -1;
   cleanup_close int mems_fd = -1;
   cleanup_close int cpus_fd = -1;
+  bool has_cpus = false, has_mems = false;
   int b_len;
 
-  dirfd = open (path, O_DIRECTORY | O_RDONLY);
+  dirfd = open (path, O_DIRECTORY | O_PATH | O_CLOEXEC);
   if (UNLIKELY (dirfd < 0))
     return crun_make_error (err, errno, "open `%s`", path);
 
+  /* If we don't yet have a cpu/mem value to base the child off of, we attempt to read it.
+   * Either, it's the newly created cgroup (and thus is still empty), or it's a parent that's been
+   * prepopulated. */
   if (cpus[0] == '\0')
     {
-      cpus_fd = openat (dirfd, "cpuset.cpus", O_RDWR);
+      cpus_fd = openat (dirfd, "cpuset.cpus", O_RDWR | O_CLOEXEC);
+      if (UNLIKELY (cpus_fd < 0 && errno == ENOENT))
+        cpus_fd = openat (dirfd, "cpus", O_RDWR | O_CLOEXEC);
       if (UNLIKELY (cpus_fd < 0))
-        return crun_make_error (err, errno, "open '%s/%s'", path, "cpuset.cpus");
+        return crun_make_error (err, errno, "open `%s/%s`", path, "cpuset.cpus");
 
       b_len = TEMP_FAILURE_RETRY (read (cpus_fd, cpus, 256));
       if (UNLIKELY (b_len < 0))
-        return crun_make_error (err, errno, "read from 'cpuset.cpus'");
+        return crun_make_error (err, errno, "read from `cpuset.cpus`");
       cpus[b_len] = '\0';
       if (cpus[0] == '\n')
         cpus[0] = '\0';
+      if (cpus[0] != '\0')
+        has_cpus = true;
     }
 
   if (mems[0] == '\0')
     {
-      mems_fd = openat (dirfd, "cpuset.mems", O_RDWR);
+      mems_fd = openat (dirfd, "cpuset.mems", O_RDWR | O_CLOEXEC);
+      if (UNLIKELY (mems_fd < 0 && errno == ENOENT))
+        mems_fd = openat (dirfd, "mems", O_RDWR | O_CLOEXEC);
       if (UNLIKELY (mems_fd < 0))
-        return crun_make_error (err, errno, "open '%s/%s'", path, "cpuset.mems");
+        return crun_make_error (err, errno, "open `%s/%s`", path, "cpuset.mems");
 
       b_len = TEMP_FAILURE_RETRY (read (mems_fd, mems, 256));
       if (UNLIKELY (b_len < 0))
-        return crun_make_error (err, errno, "read from 'cpuset.mems'");
+        return crun_make_error (err, errno, "read from `cpuset.mems`");
       mems[b_len] = '\0';
       if (mems[0] == '\n')
         mems[0] = '\0';
+      if (mems[0] != '\0')
+        has_mems = true;
     }
 
-  /* look up in the parent directory.  */
+  /* If we fail to find one, we should continue searching up until we find one */
   if (cpus[0] == '\0' || mems[0] == '\0')
     {
       size_t parent_path_len;
@@ -90,7 +105,7 @@ initialize_cpuset_subsystem_rec (char *path, size_t path_len, char *cpus, char *
         return 0;
 
       path[parent_path_len] = '\0';
-      ret = initialize_cpuset_subsystem_rec (path, parent_path_len, cpus, mems, err);
+      ret = initialize_cpuset_subsystem_rec (path, parent_path_len, cpus, mems, resources, err);
       path[parent_path_len] = '/';
       if (UNLIKELY (ret < 0))
         {
@@ -99,24 +114,37 @@ initialize_cpuset_subsystem_rec (char *path, size_t path_len, char *cpus, char *
         }
     }
 
+  /* If we know the resources, use them, instead of initializing with the full set, only to revert it later.
+   * Only do so if we didn't read the cpus and mems we have from this cgroup.
+   * Otherwise, we'll clobber existing values, which is problematic when there are multiple containers in a cgroup. */
+  if (resources && resources->cpu)
+    {
+      if (resources->cpu->cpus && ! has_cpus)
+        cpus = allocated_cpus = xstrdup (resources->cpu->cpus);
+      if (resources->cpu->mems && ! has_mems)
+        mems = allocated_mems = xstrdup (resources->cpu->mems);
+    }
+
+  /* Finally, if we have a fd to populate, write the value chosen. If we have a value from the resources struct to base it off of,
+   * use that, otherwise use the parent's. */
   if (cpus_fd >= 0)
     {
       b_len = TEMP_FAILURE_RETRY (write (cpus_fd, cpus, strlen (cpus)));
       if (UNLIKELY (b_len < 0))
-        return crun_make_error (err, errno, "write 'cpuset.cpus'");
+        return crun_make_error (err, errno, "write `cpuset.cpus`");
     }
 
   if (mems_fd >= 0)
     {
       b_len = TEMP_FAILURE_RETRY (write (mems_fd, mems, strlen (mems)));
       if (UNLIKELY (b_len < 0))
-        return crun_make_error (err, errno, "write 'cpuset.mems'");
+        return crun_make_error (err, errno, "write `cpuset.mems`");
     }
 
   return 0;
 }
 
-static int
+int
 initialize_cpuset_subsystem (const char *path, libcrun_error_t *err)
 {
   cleanup_free char *tmp_path = xstrdup (path);
@@ -124,7 +152,18 @@ initialize_cpuset_subsystem (const char *path, libcrun_error_t *err)
   char mems_buf[257];
 
   cpus_buf[0] = mems_buf[0] = '\0';
-  return initialize_cpuset_subsystem_rec (tmp_path, strlen (tmp_path), cpus_buf, mems_buf, err);
+  return initialize_cpuset_subsystem_rec (tmp_path, strlen (tmp_path), cpus_buf, mems_buf, NULL, err);
+}
+
+int
+initialize_cpuset_subsystem_resources (const char *path, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
+{
+  cleanup_free char *tmp_path = xstrdup (path);
+  char cpus_buf[257];
+  char mems_buf[257];
+
+  cpus_buf[0] = mems_buf[0] = '\0';
+  return initialize_cpuset_subsystem_rec (tmp_path, strlen (tmp_path), cpus_buf, mems_buf, resources, err);
 }
 
 static int
@@ -135,7 +174,7 @@ initialize_memory_subsystem (const char *path, libcrun_error_t *err)
   cleanup_close int dirfd = -1;
   int i;
 
-  dirfd = open (path, O_DIRECTORY | O_RDONLY);
+  dirfd = open (path, O_DIRECTORY | O_PATH | O_CLOEXEC);
   if (UNLIKELY (dirfd < 0))
     return crun_make_error (err, errno, "open `%s`", path);
 
@@ -161,7 +200,7 @@ enter_cgroup_subsystem (pid_t pid, const char *subsystem, const char *path, bool
   cleanup_free char *cgroup_path = NULL;
   int ret;
 
-  ret = append_paths (&cgroup_path, err, CGROUP_ROOT, subsystem ? subsystem : "", path ? path : "", NULL);
+  ret = append_paths (&cgroup_path, err, CGROUP_ROOT, subsystem, path ? path : "", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -243,7 +282,7 @@ copy_owner (const char *from, const char *to, libcrun_error_t *err)
 
   ret = get_file_owner (from, &uid, &gid);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "cannot get file owner for %s", from);
+    return crun_make_error (err, errno, "cannot get file owner for `%s`", from);
 
   if (uid == 0 && gid == 0)
     return 0;
@@ -267,13 +306,13 @@ read_unified_cgroup_pid (pid_t pid, char **path, libcrun_error_t *err)
 
   from = strstr (content, "0::");
   if (UNLIKELY (from == NULL))
-    return crun_make_error (err, -1, "cannot find cgroup2 for the process %d", pid);
+    return crun_make_error (err, 0, "cannot find cgroup2 for the process `%d`", pid);
 
   from += 3;
 
   to = strchr (from, '\n');
   if (UNLIKELY (to == NULL))
-    return crun_make_error (err, -1, "cannot parse `%s`", cgroup_path);
+    return crun_make_error (err, 0, "cannot parse `%s`", cgroup_path);
   *to = '\0';
 
   *path = xstrdup (from);
@@ -299,7 +338,7 @@ enter_cgroup_v1 (pid_t pid, const char *path, bool create_if_missing, libcrun_er
   if (UNLIKELY (rootless < 0))
     return rootless;
 
-  ret = read_all_file ("/proc/self/cgroup", &content, &content_size, err);
+  ret = read_all_file (PROC_SELF_CGROUP, &content, &content_size, err);
   if (UNLIKELY (ret < 0))
     {
       if (crun_error_get_errno (err) == ENOENT)
@@ -321,6 +360,11 @@ enter_cgroup_v1 (pid_t pid, const char *path, bool create_if_missing, libcrun_er
         controller += 5;
 
       subsystem = controller[0] == '\0' ? "unified" : controller;
+
+      if (strcmp (subsystem, "net_prio,net_cls") == 0)
+        subsystem = "net_cls,net_prio";
+      if (strcmp (subsystem, "cpuacct,cpu") == 0)
+        subsystem = "cpu,cpuacct";
 
       snprintf (subsystem_path, sizeof (subsystem_path), CGROUP_ROOT "/%s", subsystem);
       ret = crun_path_exists (subsystem_path, err);
@@ -383,7 +427,7 @@ enter_cgroup_v2 (pid_t pid, pid_t init_pid, const char *path, bool create_if_mis
     {
       crun_error_release (err);
 
-      ret = make_cgroup_threaded (path, err);
+      ret = maybe_make_cgroup_threaded (path, err);
       if (UNLIKELY (ret < 0))
         return ret;
 
@@ -449,8 +493,18 @@ int
 enter_cgroup (int cgroup_mode, pid_t pid, pid_t init_pid, const char *path,
               bool create_if_missing, libcrun_error_t *err)
 {
+  int ret;
   if (cgroup_mode == CGROUP_MODE_UNIFIED)
-    return enter_cgroup_v2 (pid, init_pid, path, create_if_missing, err);
-
-  return enter_cgroup_v1 (pid, path, create_if_missing, err);
+    {
+      ret = enter_cgroup_v2 (pid, init_pid, path, create_if_missing, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+  else
+    {
+      ret = enter_cgroup_v1 (pid, path, create_if_missing, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+  return 0;
 }

@@ -27,13 +27,17 @@ struct crun_global_arguments
   char *log_format;
   const char *handler;
 
+  int argc;
+  int verbosity;
+  char **argv;
+
   bool command;
-  bool debug;
   bool option_systemd_cgroup;
   bool option_force_no_cgroup;
 };
 
 char *argp_mandatory_argument (char *arg, struct argp_state *state);
+int parse_int_or_fail (const char *str, const char *kind);
 int init_libcrun_context (libcrun_context_t *con, const char *id, struct crun_global_arguments *glob,
                           libcrun_error_t *err);
 void crun_assert_n_args (int n, int min, int max);
