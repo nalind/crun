@@ -17,8 +17,8 @@
  */
 #define _GNU_SOURCE
 
-#include <linux/limits.h>
 #include <config.h>
+#include <linux/limits.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -37,6 +37,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sched.h>
+
+#ifdef HAVE_LINUX_IOPRIO_H
+#  include <linux/ioprio.h>
+#endif
 
 #ifdef HAVE_SECCOMP
 #  include <linux/seccomp.h>
@@ -73,6 +77,22 @@
         if (status)                                           \
           exit (status);                                      \
     } while (0)
+#endif
+
+#ifdef HAVE_LINUX_IOPRIO_H
+static int
+syscall_ioprio_get (int which, int who)
+{
+#  ifdef __NR_ioprio_get
+  return syscall (__NR_ioprio_get, which, who);
+#  else
+  (void) which;
+  (void) who;
+  (void) ioprio;
+  errno = ENOSYS;
+  return -1;
+#  endif
+}
 #endif
 
 struct mount_attr_s
@@ -201,7 +221,7 @@ check_idmapped_mounts (const char *path)
 static int
 cat (char *file)
 {
-  FILE *f = fopen (file, "rb");
+  FILE *f = fopen (file, "rbe");
   char buf[512];
   if (f == NULL)
     error (EXIT_FAILURE, errno, "fopen");
@@ -344,7 +364,7 @@ memhog (int megabytes)
   while (1)
     {
       /* change one page each 0.1 seconds */
-      nanosleep ((const struct timespec[]){ { 0, 100000000L } }, NULL);
+      nanosleep ((const struct timespec[]) { { 0, 100000000L } }, NULL);
       buf[pos] = 'c';
       pos += sysconf (_SC_PAGESIZE);
       if (pos > megabytes * 1024 * 1024)
@@ -401,6 +421,23 @@ main (int argc, char **argv)
       return cat (argv[2]);
     }
 
+  if (strcmp (argv[1], "readlink") == 0)
+    {
+      ssize_t ret;
+      char *buf = malloc (PATH_MAX);
+      if (buf == NULL)
+        error (EXIT_FAILURE, errno, "malloc");
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'readlink' requires an argument");
+
+      ret = readlink (argv[2], buf, PATH_MAX);
+      if (ret < 0)
+        error (EXIT_FAILURE, errno, "readlink");
+      printf ("%.*s", (int) ret, buf);
+      free (buf);
+      return 0;
+    }
+
   if (strcmp (argv[1], "open") == 0)
     {
       if (argc < 3)
@@ -418,6 +455,51 @@ main (int argc, char **argv)
       return 0;
     }
 
+  if (strcmp (argv[1], "type") == 0)
+    {
+      struct stat st;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'type' requires two arguments");
+      if (stat (argv[2], &st) < 0)
+        error (EXIT_FAILURE, errno, "stat %s", argv[2]);
+
+      switch (st.st_mode & S_IFMT)
+        {
+        case S_IFBLK:
+          printf ("block device\n");
+          break;
+        case S_IFCHR:
+          printf ("character device\n");
+          break;
+
+        case S_IFDIR:
+          printf ("directory\n");
+          break;
+
+        case S_IFIFO:
+          printf ("FIFO/pipe\n");
+          break;
+
+        case S_IFLNK:
+          printf ("symlink\n");
+          break;
+
+        case S_IFREG:
+          printf ("regular file\n");
+          break;
+
+        case S_IFSOCK:
+          printf ("socket\n");
+          break;
+
+        default:
+          printf ("unknown?\n");
+          break;
+        }
+      return 0;
+    }
+
   if (strcmp (argv[1], "owner") == 0)
     {
       struct stat st;
@@ -428,6 +510,19 @@ main (int argc, char **argv)
         error (EXIT_FAILURE, errno, "stat %s", argv[2]);
 
       printf ("%d:%d", st.st_uid, st.st_gid);
+      return 0;
+    }
+
+  if (strcmp (argv[1], "mode") == 0)
+    {
+      struct stat st;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'mode' requires two arguments");
+      if (stat (argv[2], &st) < 0)
+        error (EXIT_FAILURE, errno, "stat %s", argv[2]);
+
+      printf ("%o", st.st_mode & 07777);
       return 0;
     }
 
@@ -555,6 +650,21 @@ main (int argc, char **argv)
       return 0;
     }
 
+  if (strcmp (argv[1], "ioprio") == 0)
+    {
+#ifdef HAVE_LINUX_IOPRIO_H
+      int ret = syscall_ioprio_get (IOPRIO_WHO_PROCESS, 0);
+      if (ret >= 0)
+        {
+          printf ("%d\n", ret);
+          return 0;
+        }
+      error (EXIT_FAILURE, errno, "`ioprio_get` failed");
+#else
+      error (EXIT_FAILURE, 0, "`ioprio_get` not supported");
+#endif
+    }
+
   if (strcmp (argv[1], "ls") == 0)
     {
       /* Fork so that ls /proc/1/fd doesn't show more fd's.  */
@@ -580,11 +690,26 @@ main (int argc, char **argv)
   if (strcmp (argv[1], "systemd-notify") == 0)
     return sd_notify ();
 
+  if (strcmp (argv[1], "getpgrp") == 0)
+    {
+      pid_t pid = getpgrp ();
+      printf ("%d\n", pid);
+      return 0;
+    }
+
   if (strcmp (argv[1], "check-feature") == 0)
     {
       if (argc < 3)
         error (EXIT_FAILURE, 0, "`check-feature` requires an argument");
 
+      if (strcmp (argv[2], "ioprio") == 0)
+        {
+#ifdef HAVE_LINUX_IOPRIO_H
+          if (syscall_ioprio_get (IOPRIO_WHO_PROCESS, 0) >= 0)
+            return 0;
+#endif
+          return 1;
+        }
       if (strcmp (argv[2], "idmapped-mounts") == 0)
         {
           if (argc < 4)

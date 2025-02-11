@@ -59,6 +59,7 @@
 #include <sys/syscall.h>
 
 #include "utils.h"
+#include "linux.h"
 
 /* Use our own wrapper for memfd_create. */
 #if !defined(SYS_memfd_create) && defined(__NR_memfd_create)
@@ -119,11 +120,22 @@ static int is_self_cloned(void)
 	 * Is the binary a fully-sealed memfd? We don't need CLONED_BINARY_ENV for
 	 * this, because you cannot write to a sealed memfd no matter what (so
 	 * sharing it isn't a bad thing -- and an admin could bind-mount a sealed
-	 * memfd to /usr/bin/crun to allow re-use).
+	 * memfd to /usr/bin/crun to allow reuse).
 	 */
 	ret = fcntl(fd, F_GET_SEALS);
 	if (ret >= 0) {
 		is_cloned = (ret == CRUN_MEMFD_SEALS);
+		goto out;
+	}
+
+	/* Is the binary on a read-only filesystem? We can't detect bind-mounts in
+	 * particular (in-kernel they are identical to regular mounts) but we can
+	 * at least be sure that it's read-only.  This occurs for multiple cases,
+	 * such as truly read-only filesystems like squashfs/erofs as well as
+	 * things like the ostree read-only bind mount.
+	 */
+	if (fstatfs(fd, &fsbuf) >= 0 && (fsbuf.f_flags & MS_RDONLY)) {
+		is_cloned = true;
 		goto out;
 	}
 
@@ -136,15 +148,6 @@ static int is_self_cloned(void)
 		is_cloned = false;
 		goto out;
 	}
-
-	/*
-	 * Is the binary on a read-only filesystem? We can't detect bind-mounts in
-	 * particular (in-kernel they are identical to regular mounts) but we can
-	 * at least be sure that it's read-only. In addition, to make sure that
-	 * it's *our* bind-mount we check CLONED_BINARY_ENV.
-	 */
-	if (fstatfs(fd, &fsbuf) >= 0)
-		is_cloned |= (fsbuf.f_flags & MS_RDONLY);
 
 	/*
 	 * Okay, we're a tmpfile -- or we're currently running on RHEL <=7.6
@@ -364,6 +367,17 @@ static int seal_execfd(int *fd, int fdtype)
 	return -1;
 }
 
+static int try_bindfd_mount_api(void)
+{
+	libcrun_error_t err;
+	int mountfd = get_bind_mount (-1, "/proc/self/exe", false, true, &err);
+	if (mountfd < 0) {
+		crun_error_release (&err);
+		return -1;
+	}
+	return mountfd;
+}
+
 static int try_bindfd(void)
 {
 	mode_t mask;
@@ -452,7 +466,8 @@ static ssize_t fd_to_fd(int outfd, int infd)
 
 static int clone_binary(void)
 {
-	int binfd, execfd;
+	cleanup_close int binfd = -1;
+	cleanup_close int execfd = -1;
 	struct stat statbuf = {};
 	ssize_t sent = 0;
 	int fdtype = EFD_NONE;
@@ -461,9 +476,20 @@ static int clone_binary(void)
 	 * Before we resort to copying, let's try creating an ro-binfd in one shot
 	 * by getting a handle for a read-only bind-mount of the execfd.
 	 */
+	execfd = try_bindfd_mount_api();
+	if (execfd >= 0) {
+		/* Transfer ownership to caller */
+		int ret_execfd = execfd;
+		execfd = -1;
+		return ret_execfd;
+	}
 	execfd = try_bindfd();
-	if (execfd >= 0)
-		return execfd;
+	if (execfd >= 0) {
+		/* Transfer ownership to caller */
+		int ret_execfd = execfd;
+		execfd = -1;
+		return ret_execfd;
+	}
 
 	/*
 	 * Dammit, that didn't work -- time to copy the binary to a safe place we
@@ -478,7 +504,7 @@ static int clone_binary(void)
 		goto error;
 
 	if (fstat(binfd, &statbuf) < 0)
-		goto error_binfd;
+		goto error;
 
 	while (sent < statbuf.st_size) {
 		int n = sendfile(execfd, binfd, NULL, statbuf.st_size - sent);
@@ -486,7 +512,7 @@ static int clone_binary(void)
 			/* sendfile can fail so we fallback to a dumb user-space copy. */
 			n = fd_to_fd(execfd, binfd);
 			if (n < 0)
-				goto error_binfd;
+				goto error;
 		}
 		sent += n;
 	}
@@ -497,12 +523,13 @@ static int clone_binary(void)
 	if (seal_execfd(&execfd, fdtype) < 0)
 		goto error;
 
-	return execfd;
-
-error_binfd:
-	close(binfd);
+	{
+		/* Transfer ownership to caller */
+		int ret_execfd = execfd;
+		execfd = -1;
+		return ret_execfd;
+	}
 error:
-	close(execfd);
 	return -EIO;
 }
 
@@ -511,7 +538,7 @@ extern char **environ;
 
 int ensure_cloned_binary(void)
 {
-	int execfd;
+	cleanup_close int execfd = -1;
 	char **argv = NULL;
 
 	/* Check that we're not self-cloned, and if we are then bail. */
@@ -531,6 +558,5 @@ int ensure_cloned_binary(void)
 
 	fexecve(execfd, argv, environ);
 error:
-	close(execfd);
 	return -ENOEXEC;
 }

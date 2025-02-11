@@ -43,10 +43,10 @@ libcrun_new_terminal (char **pty, libcrun_error_t *err)
   int ret;
   cleanup_close int fd = open ("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "open /dev/ptmx");
+    return crun_make_error (err, errno, "open `/dev/ptmx`");
 
   ret = ptsname_r (fd, buf, sizeof (buf));
-  if (UNLIKELY (ret < 0))
+  if (UNLIKELY (ret != 0))
     return crun_make_error (err, errno, "ptsname");
 
   ret = unlockpt (fd);
@@ -61,8 +61,8 @@ libcrun_new_terminal (char **pty, libcrun_error_t *err)
   return ret;
 }
 
-static int
-set_raw (int fd, libcrun_error_t *err)
+int
+libcrun_set_raw (int fd, void **current_status, libcrun_error_t *err)
 {
   int ret;
   struct termios termios;
@@ -70,6 +70,14 @@ set_raw (int fd, libcrun_error_t *err)
   ret = tcgetattr (fd, &termios);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "tcgetattr");
+
+  if (current_status)
+    {
+      struct terminal_status_s *s = xmalloc (sizeof (*s));
+      s->fd = fd;
+      memcpy (&(s->termios), &termios, sizeof (termios));
+      *current_status = s;
+    }
 
   cfmakeraw (&termios);
 
@@ -87,10 +95,10 @@ int
 libcrun_set_stdio (char *pty, libcrun_error_t *err)
 {
   int ret, i;
-  cleanup_close int fd = open (pty, O_RDWR);
+  cleanup_close int fd = open (pty, O_RDWR | O_CLOEXEC);
 
   if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "open %s", pty);
+    return crun_make_error (err, errno, "open `%s`", pty);
 
   for (i = 0; i < 3; i++)
     {
@@ -104,31 +112,6 @@ libcrun_set_stdio (char *pty, libcrun_error_t *err)
     return crun_make_error (err, errno, "ioctl TIOCSCTTY");
 
   return 0;
-}
-
-int
-libcrun_setup_terminal_ptmx (int fd, void **current_status, libcrun_error_t *err)
-{
-  int ret;
-  struct termios termios;
-
-  ret = tcgetattr (fd, &termios);
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "tcgetattr");
-
-  if (current_status)
-    {
-      struct terminal_status_s *s = xmalloc (sizeof (*s));
-      s->fd = 0;
-      memcpy (&(s->termios), &termios, sizeof (termios));
-      *current_status = s;
-    }
-
-  ret = tcsetattr (fd, TCSANOW, &termios);
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "tcsetattr");
-
-  return set_raw (0, err);
 }
 
 void

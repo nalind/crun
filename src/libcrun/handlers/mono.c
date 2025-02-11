@@ -42,8 +42,8 @@
 
 #if HAVE_DLOPEN && HAVE_MONO
 static int
-mono_exec (void *cookie, libcrun_container_t *container,
-           const char *pathname, char *const argv[])
+mono_exec (void *cookie arg_unused, libcrun_container_t *container arg_unused,
+           const char *pathname, char *const argv[] arg_unused)
 {
   MonoDomain *domain;
   char *path = (char *) pathname;
@@ -94,13 +94,13 @@ mono_exec (void *cookie, libcrun_container_t *container,
 }
 
 static int
-mono_load (void **cookie, libcrun_error_t *err arg_unused)
+mono_load (void **cookie, libcrun_error_t *err)
 {
   void *handle;
 
   handle = dlopen ("libmono-native.so", RTLD_NOW);
   if (handle == NULL)
-    return crun_make_error (err, 0, "could not load `libmono-2.0.so`: %s", dlerror ());
+    return crun_make_error (err, 0, "could not load `libmono-2.0.so`: `%s`", dlerror ());
   *cookie = handle;
 
   return 0;
@@ -108,8 +108,8 @@ mono_load (void **cookie, libcrun_error_t *err arg_unused)
 
 static int
 mono_configure_container (void *cookie arg_unused, enum handler_configure_phase phase,
-                          libcrun_context_t *context, libcrun_container_t *container,
-                          const char *rootfs, libcrun_error_t *err)
+                          libcrun_context_t *context arg_unused, libcrun_container_t *container,
+                          const char *rootfs arg_unused, libcrun_error_t *err)
 {
   int ret;
   if (phase != HANDLER_CONFIGURE_MOUNTS)
@@ -131,14 +131,11 @@ mono_configure_container (void *cookie arg_unused, enum handler_configure_phase 
   if (ret != 0)
     return ret;
 
-  /* release any error if set since we are going to be returning from here */
-  crun_error_release (err);
-
   return 0;
 }
 
 static int
-mono_unload (void *cookie, libcrun_error_t *err arg_unused)
+mono_unload (void *cookie, libcrun_error_t *err)
 {
   int r;
 
@@ -146,7 +143,7 @@ mono_unload (void *cookie, libcrun_error_t *err arg_unused)
     {
       r = dlclose (cookie);
       if (UNLIKELY (r < 0))
-        return crun_make_error (err, 0, "could not unload handle: %s", dlerror ());
+        return crun_make_error (err, 0, "could not unload handle: `%s`", dlerror ());
     }
   return 0;
 }
@@ -165,10 +162,11 @@ mono_can_handle_container (libcrun_container_t *container, libcrun_error_t *err 
 
 struct custom_handler_s handler_mono = {
   .name = "dotnet",
+  .alias = NULL,
   .feature_string = ".NET:mono",
   .load = mono_load,
   .unload = mono_unload,
-  .exec_func = mono_exec,
+  .run_func = mono_exec,
   .can_handle_container = mono_can_handle_container,
   .configure_container = mono_configure_container,
 };

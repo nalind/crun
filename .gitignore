@@ -69,3 +69,13 @@ tests/tests_*
 tests/*.log
 tests/*.trs
 test-suite.log
+
+# Cached files
+.cache/
+compile_commands.json
+
+# LuaRocks development files
+/luarocks
+/lua_modules
+/.luarocks
+*.rock

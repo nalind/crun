@@ -6,12 +6,12 @@ ENV PATH=/usr/bin:/usr/sbin:/root/go/bin:/usr/local/bin::/usr/local/sbin
 RUN yum install -y python git gcc automake autoconf libcap-devel \
     systemd-devel yajl-devel libseccomp-devel go-md2man conntrack-tools which \
     glibc-static python3-libmount libtool make podman xz nmap-ncat jq bats \
-    iproute openssl iputils socat && \
+    iproute openssl iputils socat criu-libs irqbalance && \
     dnf install -y 'dnf-command(builddep)' && dnf builddep -y podman && \
     dnf remove -y golang && \
     sudo dnf update -y && \
-    curl -LO https://go.dev/dl/go1.18.1.linux-amd64.tar.gz && \
-    sudo tar -C /usr/local -xzf go1.18.1.linux-amd64.tar.gz && \
+    curl -LO https://dl.google.com/go/go1.19.4.linux-amd64.tar.gz && \
+    sudo tar -C /usr/local -xzf go1.19.4.linux-amd64.tar.gz && \
     export GOPATH=$HOME/go && \
     export GOROOT=/usr/local/go && \
     export PATH=$GOPATH/bin:$GOROOT/bin:$PATH && \
@@ -32,7 +32,7 @@ RUN yum install -y python git gcc automake autoconf libcap-devel \
     git clone https://github.com/kubernetes-sigs/cri-tools && \
     cd /root/go/src/github.com/kubernetes-sigs/cri-tools && \
     make && \
-    cp build/bin/crictl /usr/local/bin/)
+    cp build/bin/linux/*/crictl /usr/local/bin/)
 
 COPY run-tests.sh /usr/local/bin
 WORKDIR /root/go/src/github.com/cri-o/cri-o

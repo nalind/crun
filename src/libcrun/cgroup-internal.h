@@ -29,6 +29,7 @@ enum
   CGROUP_CPUSET = 1 << 3,
   CGROUP_PIDS = 1 << 4,
   CGROUP_IO = 1 << 5,
+  CGROUP_MISC = 1 << 6,
 };
 
 struct libcrun_cgroup_status
@@ -43,10 +44,11 @@ struct libcrun_cgroup_manager
 {
   /* Create a new cgroup and fill PATH in OUT.  */
   int (*create_cgroup) (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status *out, libcrun_error_t *err);
+  int (*precreate_cgroup) (struct libcrun_cgroup_args *args, int *dirfd, libcrun_error_t *err);
   /* Destroy the cgroup and kill any process if needed.  */
   int (*destroy_cgroup) (struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
   /* Additional resources configuration specific to this manager.  */
-  int (*update_resources) (struct libcrun_cgroup_status *cgroup_status, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err);
+  int (*update_resources) (struct libcrun_cgroup_status *cgroup_status, const char *state_root, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err);
 };
 
 int move_process_to_cgroup (pid_t pid, const char *subsystem, const char *path, libcrun_error_t *err);
@@ -78,5 +80,12 @@ convert_shares_to_weight (uint64_t shares)
   /* convert linearly from 2-262144 to 1-10000.  */
   return (1 + ((shares - 2) * 9999) / 262142);
 }
+
+int initialize_cpuset_subsystem (const char *path, libcrun_error_t *err);
+int initialize_cpuset_subsystem_resources (const char *path, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err);
+
+int write_cpuset_resources (int dirfd_cpuset, int cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err);
+
+int write_cpu_burst (int cpu_dirfd, bool cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err);
 
 #endif
