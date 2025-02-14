@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <config.h>
 #include "utils.h"
+#include "ring_buffer.h"
 #include <stdarg.h>
 #include <unistd.h>
 #include <string.h>
@@ -40,10 +41,14 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 #include <limits.h>
-#include <stdarg.h>
 #include <sys/mman.h>
 #ifdef HAVE_LINUX_OPENAT2_H
 #  include <linux/openat2.h>
+#endif
+#if HAVE_STDATOMIC_H
+#  include <stdatomic.h>
+#else
+#  define atomic_long volatile long
 #endif
 
 #ifndef CLOSE_RANGE_CLOEXEC
@@ -85,11 +90,15 @@ syscall_openat2 (int dirfd, const char *path, uint64_t flags, uint64_t mode, uin
 }
 
 int
-crun_path_exists (const char *path, libcrun_error_t *err arg_unused)
+crun_path_exists (const char *path, libcrun_error_t *err)
 {
   int ret = access (path, F_OK);
   if (ret < 0)
-    return 0;
+    {
+      if (errno == ENOENT)
+        return 0;
+      return crun_make_error (err, errno, "access `%s`", path);
+    }
   return 1;
 }
 
@@ -112,46 +121,18 @@ xasprintf (char **str, const char *fmt, ...)
 int
 write_file_at_with_flags (int dirfd, int flags, mode_t mode, const char *name, const void *data, size_t len, libcrun_error_t *err)
 {
-  cleanup_close int fd = openat (dirfd, name, O_WRONLY | flags, mode);
+  cleanup_close int fd = -1;
   int ret = 0;
+
+  fd = openat (dirfd, name, O_CLOEXEC | O_WRONLY | flags, mode);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "opening file `%s` for writing", name);
 
-  if (len)
-    {
-      ret = TEMP_FAILURE_RETRY (write (fd, data, len));
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, errno, "writing file `%s`", name);
-    }
-
-  return ret;
-}
-
-int
-write_file_at (int dirfd, const char *name, const void *data, size_t len, libcrun_error_t *err)
-{
-  return write_file_at_with_flags (dirfd, O_CREAT | O_TRUNC, 0700, name, data, len, err);
-}
-
-int
-write_file_with_flags (const char *name, int flags, const void *data, size_t len, libcrun_error_t *err)
-{
-  cleanup_close int fd = open (name, O_WRONLY | flags, 0700);
-  int ret;
-  if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "opening file `%s` for writing", name);
-
-  ret = TEMP_FAILURE_RETRY (write (fd, data, len));
+  ret = safe_write (fd, name, data, len, err);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "writing file `%s`", name);
+    return ret;
 
-  return ret;
-}
-
-int
-write_file (const char *name, const void *data, size_t len, libcrun_error_t *err)
-{
-  return write_file_with_flags (name, O_CREAT | O_TRUNC, data, len, err);
+  return (len > INT_MAX) ? INT_MAX : (int) len;
 }
 
 int
@@ -200,6 +181,7 @@ fallback:
 int
 get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path)
 {
+  int empty_path = path == NULL ? AT_EMPTY_PATH : 0;
   struct stat st;
   int ret;
 
@@ -208,7 +190,7 @@ get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path)
     0,
   };
 
-  ret = statx (dirfd, path, (nofollow ? AT_SYMLINK_NOFOLLOW : 0) | AT_STATX_DONT_SYNC, STATX_TYPE, &stx);
+  ret = statx (dirfd, path ?: "", empty_path | (nofollow ? AT_SYMLINK_NOFOLLOW : 0) | AT_STATX_DONT_SYNC, STATX_TYPE, &stx);
   if (UNLIKELY (ret < 0))
     {
       if (errno == ENOSYS || errno == EINVAL)
@@ -221,7 +203,7 @@ get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path)
 
 fallback:
 #endif
-  ret = fstatat (dirfd, path, &st, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+  ret = fstatat (dirfd, path ?: "", &st, empty_path | (nofollow ? AT_SYMLINK_NOFOLLOW : 0));
   *mode = st.st_mode;
   return ret;
 }
@@ -233,17 +215,17 @@ get_file_type (mode_t *mode, bool nofollow, const char *path)
 }
 
 int
-create_file_if_missing_at (int dirfd, const char *file, libcrun_error_t *err)
+create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_error_t *err)
 {
-  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY, 0700);
+  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY, mode);
   if (fd_write < 0)
     {
-      mode_t mode;
+      mode_t tmp_mode;
       int ret;
 
       /* On errors, check if the file already exists.  */
-      ret = get_file_type_at (dirfd, &mode, false, file);
-      if (ret == 0 && S_ISREG (mode))
+      ret = get_file_type_at (dirfd, &tmp_mode, false, file);
+      if (ret == 0 && S_ISREG (tmp_mode))
         return 0;
 
       return crun_make_error (err, errno, "creating file `%s`", file);
@@ -266,10 +248,14 @@ ensure_directory_internal_at (int dirfd, char *path, size_t len, int mode, libcr
 
       if (parent_created || errno != ENOENT)
         {
+          libcrun_error_t tmp_err = NULL;
+
           /* On errors check if the directory already exists.  */
-          ret = crun_dir_p (path, false, err);
+          ret = crun_dir_p (path, false, &tmp_err);
           if (ret > 0)
             return 0;
+          if (ret < 0)
+            crun_error_release (&tmp_err);
 
           return crun_make_error (err, errno, "create directory `%s`", path);
         }
@@ -315,16 +301,16 @@ crun_ensure_directory_at (int dirfd, const char *path, int mode, bool nofollow, 
 static int
 check_fd_under_path (const char *rootfs, size_t rootfslen, int fd, const char *fdname, libcrun_error_t *err)
 {
-  int ret;
+  proc_fd_path_t fdpath;
   char link[PATH_MAX];
-  char fdpath[64];
+  int ret;
 
-  sprintf (fdpath, "/proc/self/fd/%d", fd);
+  get_proc_self_fd_path (fdpath, fd);
   ret = TEMP_FAILURE_RETRY (readlink (fdpath, link, sizeof (link)));
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "readlink `%s`", fdname);
 
-  if (((size_t) ret) <= rootfslen || memcmp (link, rootfs, rootfslen) != 0)
+  if (((size_t) ret) <= rootfslen || memcmp (link, rootfs, rootfslen) != 0 || link[rootfslen] != '/')
     return crun_make_error (err, 0, "target `%s` not under the directory `%s`", fdname, rootfs);
 
   return 0;
@@ -344,12 +330,13 @@ close_and_replace (int *oldfd, int newfd)
 char *chroot_realpath (const char *chroot, const char *path, char resolved_path[]);
 
 static int
-safe_openat_fallback (int dirfd, const char *rootfs, size_t rootfs_len, const char *path,
-                      int flags, int mode, libcrun_error_t *err)
+safe_openat_fallback (int dirfd, const char *rootfs, const char *path, int flags,
+                      int mode, libcrun_error_t *err)
 {
   const char *path_in_chroot;
   cleanup_close int fd = -1;
   char buffer[PATH_MAX];
+  size_t rootfs_len = strlen (rootfs);
   int ret;
 
   path_in_chroot = chroot_realpath (rootfs, path, buffer);
@@ -384,7 +371,7 @@ safe_openat_fallback (int dirfd, const char *rootfs, size_t rootfs_len, const ch
 }
 
 int
-safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path, int flags, int mode,
+safe_openat (int dirfd, const char *rootfs, const char *path, int flags, int mode,
              libcrun_error_t *err)
 {
   static bool openat2_supported = true;
@@ -401,7 +388,7 @@ safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path,
           if (errno == ENOSYS)
             openat2_supported = false;
           if (errno == ENOSYS || errno == EINVAL || errno == EPERM)
-            return safe_openat_fallback (dirfd, rootfs, rootfs_len, path, flags, mode, err);
+            return safe_openat_fallback (dirfd, rootfs, path, flags, mode, err);
 
           return crun_make_error (err, errno, "openat2 `%s`", path);
         }
@@ -409,12 +396,13 @@ safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path,
       return ret;
     }
 
-  return safe_openat_fallback (dirfd, rootfs, rootfs_len, path, flags, mode, err);
+  return safe_openat_fallback (dirfd, rootfs, path, flags, mode, err);
 }
 
-static ssize_t
+ssize_t
 safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun_error_t *err)
 {
+  /* Add 1 to make room for the NUL terminator.  */
   ssize_t buf_size = hint > 0 ? hint + 1 : 512;
   cleanup_free char *tmp_buf = NULL;
   ssize_t size;
@@ -424,8 +412,7 @@ safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun
       if (tmp_buf != NULL)
         buf_size += 256;
 
-      /* Allocate an extra byte so the buffer can be NUL terminated.  */
-      tmp_buf = xrealloc (tmp_buf, buf_size + 1);
+      tmp_buf = xrealloc (tmp_buf, buf_size);
 
       size = readlinkat (dfd, name, tmp_buf, buf_size);
       if (UNLIKELY (size < 0))
@@ -444,8 +431,7 @@ safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun
 
 static int
 crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
-                     size_t dirpath_len, const char *path, int mode,
-                     int max_readlinks, libcrun_error_t *err)
+                     const char *path, int mode, int max_readlinks, libcrun_error_t *err)
 {
   cleanup_close int wd_cleanup = -1;
   cleanup_free char *npath = NULL;
@@ -511,7 +497,7 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
                   if (LIKELY (ret >= 0))
                     {
                       return crun_safe_ensure_at (do_open, dir, dirfd,
-                                                  dirpath, dirpath_len,
+                                                  dirpath,
                                                   resolved_path, mode,
                                                   max_readlinks - 1, err);
                     }
@@ -520,7 +506,7 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
               /* If the previous openat fails, attempt to open the file in O_PATH mode.  */
               ret = openat (cwd, cur, O_CLOEXEC | O_PATH, 0);
               if (ret < 0)
-                return crun_make_error (err, errno, "open `%s/%s`", dirpath, cur);
+                return crun_make_error (err, errno, "open `%s/%s`", dirpath, npath);
             }
 
           if (do_open)
@@ -534,12 +520,31 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
       if (ret < 0)
         {
           if (errno != EEXIST)
-            return crun_make_error (err, errno, "mkdir `%s`", cur);
+            return crun_make_error (err, errno, "mkdir `/%s`", npath);
         }
 
-      cwd = safe_openat (dirfd, dirpath, dirpath_len, npath, O_CLOEXEC | O_PATH, 0, err);
+      cwd = safe_openat (dirfd, dirpath, npath, (last_component ? O_PATH : 0) | O_CLOEXEC, 0, err);
       if (UNLIKELY (cwd < 0))
-        return cwd;
+        return crun_error_wrap (err, "creating `/%s`", path);
+
+      if (! last_component)
+        {
+          mode_t st_mode;
+
+          ret = get_file_type_at (cwd, &st_mode, true, NULL);
+          if (UNLIKELY (ret < 0))
+            {
+              int saved_errno = errno;
+
+              close (cwd);
+              return crun_make_error (err, saved_errno, "error stat'ing file `%s`", npath);
+            }
+          if ((st_mode & S_IFMT) != S_IFDIR)
+            {
+              close (cwd);
+              return crun_make_error (err, ENOTDIR, "error creating directory `%s` since `%s` exists and it is not a directory", path, npath);
+            }
+        }
 
       close_and_replace (&wd_cleanup, cwd);
 
@@ -570,64 +575,37 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
 }
 
 int
-crun_safe_create_and_open_ref_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_len,
-                                  const char *path, int mode, libcrun_error_t *err)
+crun_safe_create_and_open_ref_at (bool dir, int dirfd, const char *dirpath, const char *path, int mode, libcrun_error_t *err)
 {
   int fd;
 
   /* If the file/dir already exists, just open it.  */
-  fd = safe_openat (dirfd, dirpath, dirpath_len, path, O_PATH | O_CLOEXEC, 0, err);
+  fd = safe_openat (dirfd, dirpath, path, O_PATH | O_CLOEXEC, 0, err);
   if (LIKELY (fd >= 0))
     return fd;
 
-  return crun_safe_ensure_at (true, dir, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
+  crun_error_release (err);
+  return crun_safe_ensure_at (true, dir, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
-crun_safe_ensure_directory_at (int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
+crun_safe_ensure_directory_at (int dirfd, const char *dirpath, const char *path, int mode,
                                libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (false, true, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, true, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
-crun_safe_ensure_file_at (int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
+crun_safe_ensure_file_at (int dirfd, const char *dirpath, const char *path, int mode,
                           libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (false, false, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, false, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
 crun_ensure_directory (const char *path, int mode, bool nofollow, libcrun_error_t *err)
 {
   return crun_ensure_directory_at (AT_FDCWD, path, mode, nofollow, err);
-}
-
-int
-crun_ensure_file_at (int dirfd, const char *path, int mode, bool nofollow, libcrun_error_t *err)
-{
-  cleanup_free char *tmp = xstrdup (path);
-  size_t len = strlen (tmp);
-  char *it = tmp + len - 1;
-  int ret;
-
-  while (*it != '/' && it > tmp)
-    it--;
-  if (it > tmp)
-    {
-      *it = '\0';
-      ret = crun_ensure_directory_at (dirfd, tmp, mode, nofollow, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-      *it = '/';
-    }
-  return create_file_if_missing_at (dirfd, tmp, err);
-}
-
-int
-crun_ensure_file (const char *path, int mode, bool nofollow, libcrun_error_t *err)
-{
-  return crun_ensure_file_at (AT_FDCWD, path, mode, nofollow, err);
 }
 
 static int
@@ -691,11 +669,33 @@ check_running_in_user_namespace (libcrun_error_t *err)
 
   ret = read_all_file ("/proc/self/uid_map", &buffer, &len, err);
   if (UNLIKELY (ret < 0))
-    return ret;
+    {
+      /* If the file does not exist, then the kernel does not support user namespaces and we for sure aren't in one.  */
+      if (crun_error_get_errno (err) == ENOENT)
+        {
+          crun_error_release (err);
+          run_in_userns = 0;
+          return run_in_userns;
+        }
+      return ret;
+    }
 
   ret = strstr (buffer, "4294967295") ? 0 : 1;
   run_in_userns = ret;
   return ret;
+}
+
+static size_t
+get_page_size ()
+{
+  static atomic_long cached_pagesize = 0;
+  atomic_long pagesize = cached_pagesize;
+  if (pagesize == 0)
+    {
+      pagesize = (long) sysconf (_SC_PAGESIZE);
+      cached_pagesize = pagesize;
+    }
+  return (size_t) pagesize;
 }
 
 static int selinux_enabled = -1;
@@ -714,9 +714,9 @@ libcrun_initialize_selinux (libcrun_error_t *err)
 
   fd = open ("/proc/mounts", O_RDONLY | O_CLOEXEC);
   if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "open /proc/mounts");
+    return crun_make_error (err, errno, "open `/proc/mounts`");
 
-  ret = read_all_fd (fd, "/proc/mounts", &out, &len, err);
+  ret = read_all_fd_with_size_hint (fd, "/proc/mounts", &out, &len, get_page_size (), err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -758,7 +758,7 @@ libcrun_is_selinux_enabled (libcrun_error_t *err)
 }
 
 int
-add_selinux_mount_label (char **retlabel, const char *data, const char *label, libcrun_error_t *err arg_unused)
+add_selinux_mount_label (char **retlabel, const char *data, const char *label, const char *context_type, libcrun_error_t *err)
 {
   int ret;
 
@@ -769,43 +769,91 @@ add_selinux_mount_label (char **retlabel, const char *data, const char *label, l
   if (label && ret)
     {
       if (data && *data)
-        xasprintf (retlabel, "%s,context=\"%s\"", data, label);
+        xasprintf (retlabel, "%s,%s=\"%s\"", data, context_type, label);
       else
-        xasprintf (retlabel, "context=\"%s\"", label);
+        xasprintf (retlabel, "%s=\"%s\"", context_type, label);
       return 0;
     }
   *retlabel = xstrdup (data);
   return 0;
 }
 
+static const char *
+lsm_attr_path (const char *lsm, const char *fname, libcrun_error_t *err)
+{
+  cleanup_close int attr_dirfd = -1;
+  cleanup_close int lsm_dirfd = -1;
+  char *attr_path = NULL;
+
+  attr_dirfd = open ("/proc/thread-self/attr", O_DIRECTORY | O_PATH | O_CLOEXEC);
+  if (UNLIKELY (attr_dirfd < 0))
+    {
+      crun_make_error (err, errno, "open `/proc/thread-self/attr`");
+      return NULL;
+    }
+
+  // Check for newer scoped interface in /proc/thread-self/attr/<lsm>
+  if (lsm != NULL)
+    {
+      lsm_dirfd = openat (attr_dirfd, lsm, O_DIRECTORY | O_PATH | O_CLOEXEC);
+
+      if (UNLIKELY (lsm_dirfd < 0 && errno != ENOENT))
+        {
+          crun_make_error (err, errno, "open `/proc/thread-self/attr/%s`", lsm);
+          return NULL;
+        }
+    }
+  // Use scoped interface if available, fall back to unscoped
+  xasprintf (&attr_path, "/proc/thread-self/attr/%s%s%s", lsm_dirfd >= 0 ? lsm : "", lsm_dirfd >= 0 ? "/" : "", fname);
+
+  return attr_path;
+}
+
 static int
-write_file_and_check_fs_type (const char *file, const char *data, size_t len, unsigned int type, const char *type_name,
-                              libcrun_error_t *err)
+check_proc_super_magic (int fd, const char *path, libcrun_error_t *err)
+{
+  struct statfs sfs;
+
+  int ret = fstatfs (fd, &sfs);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "statfs `%s`", path);
+
+  if (sfs.f_type != PROC_SUPER_MAGIC)
+    return crun_make_error (err, 0, "the file `%s` is not on a `procfs` file system", path);
+
+  return 0;
+}
+
+static int
+set_security_attr (const char *lsm, const char *fname, const char *data, libcrun_error_t *err)
 {
   int ret;
-  struct statfs sfs;
+
+  cleanup_free const char *attr_path = lsm_attr_path (lsm, fname, err);
   cleanup_close int fd = -1;
 
-  fd = open (file, O_WRONLY | O_CLOEXEC);
+  if (UNLIKELY (attr_path == NULL))
+    return -1;
+
+  fd = open (attr_path, O_WRONLY | O_CLOEXEC);
+
   if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "open file `%s`", file);
+    return crun_make_error (err, errno, "open `%s`", attr_path);
 
-  ret = fstatfs (fd, &sfs);
+  ret = check_proc_super_magic (fd, attr_path, err);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "statfs `%s`", file);
+    return ret;
 
-  if (sfs.f_type != type)
-    return crun_make_error (err, 0, "the file `%s` is not on file system type `%s`", file, type_name);
-
-  ret = TEMP_FAILURE_RETRY (write (fd, data, len));
+  // Write out data
+  ret = TEMP_FAILURE_RETRY (write (fd, data, strlen (data)));
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "write file `%s`", file);
+    return crun_make_error (err, errno, "write file `%s`", attr_path);
 
   return 0;
 }
 
 int
-set_selinux_exec_label (const char *label, libcrun_error_t *err)
+set_selinux_label (const char *label, bool now, libcrun_error_t *err)
 {
   int ret;
 
@@ -814,12 +862,7 @@ set_selinux_exec_label (const char *label, libcrun_error_t *err)
     return ret;
 
   if (ret)
-    {
-      ret = write_file_and_check_fs_type ("/proc/thread-self/attr/exec", label, strlen (label), PROC_SUPER_MAGIC,
-                                          "procfs", err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-    }
+    return set_security_attr (NULL, now ? "current" : "exec", label, err);
   return 0;
 }
 
@@ -831,44 +874,79 @@ libcrun_is_apparmor_enabled (libcrun_error_t *err)
   return apparmor_enabled;
 }
 
+static int
+is_current_process_confined (libcrun_error_t *err)
+{
+  cleanup_free const char *attr_path = lsm_attr_path ("apparmor", "current", err);
+  cleanup_close int fd = -1;
+  char buf[256];
+
+  if (UNLIKELY (attr_path == NULL))
+    return -1;
+
+  fd = open (attr_path, O_RDONLY | O_CLOEXEC);
+
+  if (UNLIKELY (fd < 0))
+    return crun_make_error (err, errno, "open `%s`", attr_path);
+
+  if (UNLIKELY (check_proc_super_magic (fd, attr_path, err)))
+    return -1;
+
+  ssize_t bytes_read = read (fd, buf, sizeof (buf) - 1);
+  if (UNLIKELY (bytes_read < 0))
+    return crun_make_error (err, errno, "error reading file `%s`", attr_path);
+
+#define UNCONFINED "unconfined"
+#define UNCONFINED_LEN (ssize_t) (sizeof (UNCONFINED) - 1)
+  return bytes_read >= UNCONFINED_LEN && memcmp (buf, UNCONFINED, UNCONFINED_LEN);
+}
+
 int
-set_apparmor_profile (const char *profile, libcrun_error_t *err)
+set_apparmor_profile (const char *profile, bool no_new_privileges, bool now, libcrun_error_t *err)
 {
   int ret;
 
   ret = libcrun_is_apparmor_enabled (err);
   if (UNLIKELY (ret < 0))
     return ret;
+
   if (ret)
     {
       cleanup_free char *buf = NULL;
-
-      xasprintf (&buf, "exec %s", profile);
-
-      ret = write_file_and_check_fs_type ("/proc/thread-self/attr/exec", buf, strlen (buf), PROC_SUPER_MAGIC, "procfs",
-                                          err);
+      ret = is_current_process_confined (err);
       if (UNLIKELY (ret < 0))
         return ret;
+      // if confined only way for apparmor to allow change of profile with NNP is with stacking
+      xasprintf (&buf, "%s %s", no_new_privileges && ret ? "stack" : now ? "changeprofile"
+                                                                         : "exec",
+                 profile);
+
+      return set_security_attr ("apparmor", now ? "current" : "exec", buf, err);
     }
   return 0;
 }
 
 int
-read_all_fd (int fd, const char *description, char **out, size_t *len, libcrun_error_t *err)
+read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t *len, size_t size_hint, libcrun_error_t *err)
 {
-  int ret;
-  size_t nread, allocated;
-  off_t size = 0;
   cleanup_free char *buf = NULL;
+  size_t nread, allocated;
+  size_t pagesize = 0;
+  off_t size = 0;
+  int ret;
 
-  ret = get_file_size (fd, &size);
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "error stat'ing file `%s`", description);
+  if (size_hint)
+    allocated = size_hint;
+  else
+    {
+      ret = get_file_size (fd, &size);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, errno, "error stat'ing file `%s`", description);
+
+      allocated = size == 0 ? 1023 : size;
+    }
 
   /* NUL terminate the buffer.  */
-  allocated = size;
-  if (size == 0)
-    allocated = 4096;
   buf = xmalloc (allocated + 1);
   nread = 0;
   while ((size && nread < (size_t) size) || size == 0)
@@ -882,9 +960,27 @@ read_all_fd (int fd, const char *description, char **out, size_t *len, libcrun_e
 
       nread += ret;
 
-      allocated += 4096;
-      buf = xrealloc (buf, allocated + 1);
+      if (nread == allocated)
+        {
+          if (size)
+            break;
+
+          if (pagesize == 0)
+            pagesize = get_page_size ();
+
+          allocated += pagesize;
+
+          buf = xrealloc (buf, allocated + 1);
+        }
     }
+  if (nread + 1 < allocated)
+    {
+      /* shrink the buffer to the used size if it was allocated a bigger block.  */
+      char *tmp = realloc (buf, nread + 1);
+      if (tmp)
+        buf = tmp;
+    }
+
   buf[nread] = '\0';
   *out = buf;
   buf = NULL;
@@ -896,9 +992,9 @@ read_all_fd (int fd, const char *description, char **out, size_t *len, libcrun_e
 int
 read_all_file_at (int dirfd, const char *path, char **out, size_t *len, libcrun_error_t *err)
 {
-  cleanup_close int fd;
+  cleanup_close int fd = -1;
 
-  fd = TEMP_FAILURE_RETRY (openat (dirfd, path, O_RDONLY));
+  fd = TEMP_FAILURE_RETRY (openat (dirfd, path, O_RDONLY | O_CLOEXEC));
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error opening file `%s`", path);
 
@@ -915,13 +1011,40 @@ read_all_file (const char *path, char **out, size_t *len, libcrun_error_t *err)
 }
 
 int
+get_realpath_to_file (int dirfd, const char *path_name, char **absolute_path, libcrun_error_t *err)
+{
+  cleanup_close int targetfd = -1;
+
+  targetfd = TEMP_FAILURE_RETRY (openat (dirfd, path_name, O_RDONLY | O_CLOEXEC));
+  if (UNLIKELY (targetfd < 0))
+    return crun_make_error (err, errno, "error opening file `%s`", path_name);
+  else
+    {
+      ssize_t len;
+      proc_fd_path_t target_fd_path;
+
+      get_proc_self_fd_path (target_fd_path, targetfd);
+      len = safe_readlinkat (AT_FDCWD, target_fd_path, absolute_path, 0, err);
+      if (UNLIKELY (len < 0))
+        {
+          crun_error_release (err);
+          return crun_make_error (err, errno, "error unable to provide absolute path to file `%s`", path_name);
+        }
+    }
+
+  return 0;
+}
+
+int
 open_unix_domain_client_socket (const char *path, int dgram, libcrun_error_t *err)
 {
   struct sockaddr_un addr = {};
   int ret;
-  char name_buf[32];
+  proc_fd_path_t name_buf;
   cleanup_close int destfd = -1;
   cleanup_close int fd = -1;
+
+  libcrun_debug ("Opening UNIX domain socket: %s", path);
 
   fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
@@ -929,11 +1052,12 @@ open_unix_domain_client_socket (const char *path, int dgram, libcrun_error_t *er
 
   if (strlen (path) >= sizeof (addr.sun_path))
     {
-      destfd = open (path, O_PATH);
+      destfd = open (path, O_PATH | O_CLOEXEC);
       if (UNLIKELY (destfd < 0))
         return crun_make_error (err, errno, "error opening `%s`", path);
 
-      sprintf (name_buf, "/proc/self/fd/%d", destfd);
+      get_proc_self_fd_path (name_buf, destfd);
+
       path = name_buf;
     }
 
@@ -953,15 +1077,15 @@ int
 open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err)
 {
   struct sockaddr_un addr = {};
+  proc_fd_path_t name_buf;
   int ret;
-  char name_buf[32];
   cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error creating UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
     {
-      sprintf (name_buf, "/proc/self/fd/%d", fd);
+      get_proc_self_fd_path (name_buf, fd);
       path = name_buf;
     }
   strcpy (addr.sun_path, path);
@@ -1097,8 +1221,27 @@ create_signalfd (sigset_t *mask, libcrun_error_t *err)
   return ret;
 }
 
+static int
+epoll_helper_toggle (int epollfd, int fd, int events, libcrun_error_t *err)
+{
+  struct epoll_event ev = {};
+  bool add = events != 0;
+  int ret;
+
+  ev.events = events;
+  ev.data.fd = fd;
+  ret = epoll_ctl (epollfd, add ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, fd, &ev);
+  if (UNLIKELY (ret < 0))
+    {
+      if (errno == EEXIST || errno == ENOENT)
+        return 0;
+      return crun_make_error (err, errno, "epoll_ctl `%s` `%d`", add ? "add" : "del", fd);
+    }
+  return 0;
+}
+
 int
-epoll_helper (int *fds, int *levelfds, libcrun_error_t *err)
+epoll_helper (int *in_fds, int *in_levelfds, int *out_fds, int *out_levelfds, libcrun_error_t *err)
 {
   struct epoll_event ev;
   cleanup_close int epollfd = -1;
@@ -1109,22 +1252,24 @@ epoll_helper (int *fds, int *levelfds, libcrun_error_t *err)
   if (UNLIKELY (epollfd < 0))
     return crun_make_error (err, errno, "epoll_create1");
 
-  for (it = fds; *it >= 0; it++)
-    {
-      ev.events = EPOLLIN;
-      ev.data.fd = *it;
-      ret = epoll_ctl (epollfd, EPOLL_CTL_ADD, *it, &ev);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, errno, "epoll_ctl add '%d'", *it);
+#define ADD_FDS(FDS, EVENTS)                                            \
+  for (it = FDS; *it >= 0; it++)                                        \
+    {                                                                   \
+      ev.events = EVENTS;                                               \
+      ev.data.fd = *it;                                                 \
+      ret = epoll_ctl (epollfd, EPOLL_CTL_ADD, *it, &ev);               \
+      if (UNLIKELY (ret < 0))                                           \
+        return crun_make_error (err, errno, "epoll_ctl add `%d`", *it); \
     }
-  for (it = levelfds; *it >= 0; it++)
-    {
-      ev.events = EPOLLIN | EPOLLET;
-      ev.data.fd = *it;
-      ret = epoll_ctl (epollfd, EPOLL_CTL_ADD, *it, &ev);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, errno, "epoll_ctl add '%d'", *it);
-    }
+
+  if (in_fds)
+    ADD_FDS (in_fds, EPOLLIN);
+  if (in_levelfds)
+    ADD_FDS (in_levelfds, EPOLLIN | EPOLLET);
+  if (out_fds)
+    ADD_FDS (out_fds, EPOLLOUT);
+  if (out_levelfds)
+    ADD_FDS (out_levelfds, EPOLLOUT | EPOLLET);
 
   ret = epollfd;
   epollfd = -1;
@@ -1136,30 +1281,37 @@ copy_from_fd_to_fd (int src, int dst, int consume, libcrun_error_t *err)
 {
   int ret;
   ssize_t nread;
+  size_t pagesize = get_page_size ();
+#ifdef HAVE_COPY_FILE_RANGE
+  bool can_copy_file_range = true;
+#endif
   do
     {
       cleanup_free char *buffer = NULL;
       ssize_t remaining;
 
-#define BUFFER_SIZE 4096
-
 #ifdef HAVE_COPY_FILE_RANGE
-      nread = copy_file_range (src, NULL, dst, NULL, BUFFER_SIZE, 0);
-      if (nread < 0 && (errno == EINVAL || errno == EXDEV))
-        goto fallback;
-      if (consume && nread < 0 && errno == EAGAIN)
-        return 0;
-      if (nread < 0 && errno == EIO)
-        return 0;
-      if (UNLIKELY (nread < 0))
-        return crun_make_error (err, errno, "copy_file_range");
-      continue;
-
+      if (can_copy_file_range)
+        {
+          nread = copy_file_range (src, NULL, dst, NULL, pagesize, 0);
+          if (nread < 0 && (errno == EINVAL || errno == EXDEV))
+            {
+              can_copy_file_range = false;
+              goto fallback;
+            }
+          if (consume && nread < 0 && errno == EAGAIN)
+            return 0;
+          if (nread < 0 && errno == EIO)
+            return 0;
+          if (UNLIKELY (nread < 0))
+            return crun_make_error (err, errno, "copy_file_range");
+          continue;
+        }
     fallback:
 #endif
 
-      buffer = xmalloc (BUFFER_SIZE);
-      nread = TEMP_FAILURE_RETRY (read (src, buffer, BUFFER_SIZE));
+      buffer = xmalloc (pagesize);
+      nread = TEMP_FAILURE_RETRY (read (src, buffer, pagesize));
       if (consume && nread < 0 && errno == EAGAIN)
         return 0;
       if (nread < 0 && errno == EIO)
@@ -1275,6 +1427,7 @@ set_home_env (uid_t id)
   cleanup_free char *buf = NULL;
   long buf_size;
   cleanup_file FILE *stream = NULL;
+  int ret = -1;
 
   buf_size = sysconf (_SC_GETPW_R_SIZE_MAX);
   if (buf_size < 0)
@@ -1282,28 +1435,19 @@ set_home_env (uid_t id)
 
   buf = xmalloc (buf_size);
 
-  stream = fopen ("/etc/passwd", "r");
+  stream = fopen ("/etc/passwd", "re");
   if (stream == NULL)
-    {
-      if (errno == ENOENT)
-        goto exit;
-
-      return -1;
-    }
+    goto error;
 
   for (;;)
     {
-      int ret;
       struct passwd *ret_pw = NULL;
 
       ret = fgetpwent_r (stream, &pwd, buf, buf_size, &ret_pw);
       if (UNLIKELY (ret != 0))
         {
-          if (errno == ENOENT)
-            return 0;
-
           if (errno != ERANGE)
-            return ret;
+            goto error;
 
           buf_size *= 2;
           buf = xrealloc (buf, buf_size);
@@ -1317,10 +1461,9 @@ set_home_env (uid_t id)
         }
     }
 
-exit:
-  /* If the user was not found, set it to something reasonable.  */
-  setenv ("HOME", "/", 1);
-  return 0;
+error:
+  /* Let callers handle the error if the user was not found. */
+  return ret;
 }
 
 /*if subuid or subgid exist, take the first range for the user */
@@ -1356,7 +1499,7 @@ getsubidrange (uid_t id, int is_uid, uint32_t *from, uint32_t *len)
           return -1;
         }
 
-      if (ret < 0 && errno != ERANGE)
+      if (ret != ERANGE)
         return ret;
 
       buf_size *= 2;
@@ -1365,7 +1508,7 @@ getsubidrange (uid_t id, int is_uid, uint32_t *from, uint32_t *len)
 
   len_name = strlen (name);
 
-  input = fopen (is_uid ? "/etc/subuid" : "/etc/subgid", "r");
+  input = fopen (is_uid ? "/etc/subuid" : "/etc/subgid", "re");
   if (input == NULL)
     return -1;
 
@@ -1396,15 +1539,15 @@ getsubidrange (uid_t id, int is_uid, uint32_t *from, uint32_t *len)
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 size_t
-format_default_id_mapping (char **ret, uid_t container_id, uid_t host_id, int is_uid)
+format_default_id_mapping (char **ret, uid_t container_id, uid_t host_uid, uid_t host_id, int is_uid)
 {
-  uint32_t from, available;
+  uint32_t from = 0, available = 0;
   cleanup_free char *buffer = NULL;
   size_t written = 0;
 
   *ret = NULL;
 
-  if (getsubidrange (host_id, is_uid, &from, &available) < 0)
+  if (getsubidrange (host_uid, is_uid, &from, &available) < 0)
     return 0;
 
   /* More than enough space for all the mappings.  */
@@ -1430,6 +1573,18 @@ format_default_id_mapping (char **ret, uid_t container_id, uid_t host_id, int is
   return written;
 }
 
+static int
+unset_cloexec_flag (int fd)
+{
+  int flags = fcntl (fd, F_GETFD);
+  if (flags == -1)
+    return -1;
+
+  flags &= ~FD_CLOEXEC;
+
+  return fcntl (fd, F_SETFD, flags);
+}
+
 static void __attribute__ ((__noreturn__))
 run_process_child (char *path, char **args, const char *cwd, char **envp, int pipe_r,
                    int pipe_w, int out_fd, int err_fd)
@@ -1445,7 +1600,7 @@ run_process_child (char *path, char **args, const char *cwd, char **envp, int pi
 
   if (out_fd < 0 || err_fd < 0)
     {
-      dev_null_fd = open ("/dev/null", O_WRONLY);
+      dev_null_fd = open ("/dev/null", O_WRONLY | O_CLOEXEC);
       if (UNLIKELY (dev_null_fd < 0))
         _exit (EXIT_FAILURE);
     }
@@ -1456,6 +1611,11 @@ run_process_child (char *path, char **args, const char *cwd, char **envp, int pi
 
   dup2 (out_fd >= 0 ? out_fd : dev_null_fd, 1);
   dup2 (err_fd >= 0 ? err_fd : dev_null_fd, 2);
+
+  if (out_fd >= 0)
+    unset_cloexec_flag (1);
+  if (err_fd >= 0)
+    unset_cloexec_flag (2);
 
   if (dev_null_fd >= 0)
     TEMP_FAILURE_RETRY (close (dev_null_fd));
@@ -1490,7 +1650,7 @@ run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, i
 
   sigemptyset (&mask);
 
-  ret = pipe (stdin_pipe);
+  ret = pipe2 (stdin_pipe, O_CLOEXEC);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "pipe");
   pipe_r = stdin_pipe[0];
@@ -1522,8 +1682,13 @@ run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, i
   ret = TEMP_FAILURE_RETRY (write (pipe_w, stdin, stdin_len));
   if (UNLIKELY (ret < 0))
     {
-      ret = crun_make_error (err, errno, "writing to pipe");
-      goto restore_sig_mask_and_exit;
+      /* Ignore EPIPE as the container process could have already
+         been terminated.  */
+      if (errno != EPIPE)
+        {
+          ret = crun_make_error (err, errno, "writing to pipe");
+          goto restore_sig_mask_and_exit;
+        }
     }
 
   close_and_reset (&pipe_w);
@@ -1591,29 +1756,25 @@ mark_or_close_fds_ge_than (int n, bool close_now, libcrun_error_t *err)
   cleanup_dir DIR *dir = NULL;
   int ret;
   int fd;
-  struct statfs sfs;
   struct dirent *next;
 
   ret = syscall_close_range (n, UINT_MAX, close_now ? 0 : CLOSE_RANGE_CLOEXEC);
   if (ret == 0)
     return 0;
   if (ret < 0 && errno != EINVAL && errno != ENOSYS && errno != EPERM)
-    return crun_make_error (err, errno, "close_range from %d", n);
+    return crun_make_error (err, errno, "close_range from `%d`", n);
 
   cfd = open ("/proc/self/fd", O_DIRECTORY | O_RDONLY | O_CLOEXEC);
   if (UNLIKELY (cfd < 0))
-    return crun_make_error (err, errno, "open /proc/self/fd");
+    return crun_make_error (err, errno, "open `/proc/self/fd`");
 
-  ret = fstatfs (cfd, &sfs);
+  ret = check_proc_super_magic (cfd, "/proc/self/fd", err);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "statfs `/proc/self/fd`");
-
-  if (sfs.f_type != PROC_SUPER_MAGIC)
-    return crun_make_error (err, 0, "the path `/proc/self/fd` is not on file system type `procfs`");
+    return ret;
 
   dir = fdopendir (cfd);
   if (UNLIKELY (dir == NULL))
-    return crun_make_error (err, errno, "cannot fdopendir /proc/self/fd");
+    return crun_make_error (err, errno, "cannot fdopendir `/proc/self/fd`");
 
   /* Now it is owned by dir.  */
   cfd = -1;
@@ -1640,7 +1801,7 @@ mark_or_close_fds_ge_than (int n, bool close_now, libcrun_error_t *err)
         {
           ret = fcntl (val, F_SETFD, FD_CLOEXEC);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, errno, "cannot set CLOEXEC fd for '/proc/self/fd/%s'", name);
+            return crun_make_error (err, errno, "cannot set CLOEXEC fd for `/proc/self/fd/%s`", name);
         }
     }
   return 0;
@@ -1657,12 +1818,12 @@ get_current_timestamp (char *out, size_t len)
   gmtime_r (&tv.tv_sec, &now);
   strftime (timestamp, sizeof (timestamp), "%Y-%m-%dT%H:%M:%S", &now);
 
-  snprintf (out, len, "%s.%09ldZ", timestamp, tv.tv_usec);
+  snprintf (out, len, "%s.%06lldZ", timestamp, (long long int) tv.tv_usec);
   out[len - 1] = '\0';
 }
 
 int
-set_blocking_fd (int fd, int blocking, libcrun_error_t *err)
+set_blocking_fd (int fd, bool blocking, libcrun_error_t *err)
 {
   int ret, flags = fcntl (fd, F_GETFL, 0);
   if (UNLIKELY (flags < 0))
@@ -1686,13 +1847,6 @@ parse_json_file (yajl_val *out, const char *jsondata, struct parser_context *ctx
     return crun_make_error (err, 0, "cannot parse the data: `%s`", errbuf);
 
   return 0;
-}
-
-int
-has_prefix (const char *str, const char *prefix)
-{
-  size_t prefix_len = strlen (prefix);
-  return strlen (str) >= prefix_len && memcmp (str, prefix, prefix_len) == 0;
 }
 
 static int
@@ -1738,7 +1892,7 @@ find_executable (const char *executable_path, const char *cwd)
       return NULL;
     }
 
-  if (executable_path[0] == '.' || (executable_path[0] != '/' && strchr (executable_path, '/')))
+  if (executable_path[0] != '/' && strchr (executable_path, '/'))
     {
       cleanup_free char *cwd_allocated = NULL;
 
@@ -1776,7 +1930,7 @@ find_executable (const char *executable_path, const char *cwd)
         it = ".";
 
       len = snprintf (path, PATH_MAX, "%s/%s", it, executable_path);
-      if (len == PATH_MAX)
+      if (len >= PATH_MAX)
         continue;
 
       ret = check_access (path);
@@ -1957,11 +2111,11 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
       switch (mode & S_IFMT)
         {
         case S_IFREG:
-          srcfd = openat (dirfd (dsrcfd), de->d_name, O_NONBLOCK | O_RDONLY);
+          srcfd = openat (dirfd (dsrcfd), de->d_name, O_NONBLOCK | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
           if (UNLIKELY (srcfd < 0))
             return crun_make_error (err, errno, "open `%s/%s`", srcname, de->d_name);
 
-          destfd = openat (destdirfd, de->d_name, O_RDWR | O_CREAT, 0777);
+          destfd = openat (destdirfd, de->d_name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0777);
           if (UNLIKELY (destfd < 0))
             return crun_make_error (err, errno, "open `%s/%s`", destname, de->d_name);
 
@@ -1984,11 +2138,11 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, errno, "mkdir `%s/%s`", destname, de->d_name);
 
-          srcfd = openat (dirfd (dsrcfd), de->d_name, O_DIRECTORY);
+          srcfd = openat (dirfd (dsrcfd), de->d_name, O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
           if (UNLIKELY (srcfd < 0))
             return crun_make_error (err, errno, "open directory `%s/%s`", srcname, de->d_name);
 
-          destfd = openat (destdirfd, de->d_name, O_DIRECTORY);
+          destfd = openat (destdirfd, de->d_name, O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
           if (UNLIKELY (destfd < 0))
             return crun_make_error (err, errno, "open directory `%s/%s`", srcname, de->d_name);
 
@@ -2028,9 +2182,9 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "chown `%s/%s`", destname, de->d_name);
 
-        /*
-         * ALLPERMS is not defined by POSIX
-         */
+      /*
+       * ALLPERMS is not defined by POSIX
+       */
 #ifndef ALLPERMS
 #  define ALLPERMS (S_ISUID | S_ISGID | S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO)
 #endif
@@ -2038,41 +2192,15 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
       ret = fchmodat (destdirfd, de->d_name, mode & ALLPERMS, AT_SYMLINK_NOFOLLOW);
       if (UNLIKELY (ret < 0))
         {
+          /* If the operation fails with ENOTSUP we are dealing with a symlink, so ignore it.  */
           if (errno == ENOTSUP)
-            {
-              char proc_path[32];
-              cleanup_close int fd = -1;
+            continue;
 
-              fd = openat (destdirfd, de->d_name, O_PATH | O_NOFOLLOW);
-              if (UNLIKELY (fd < 0))
-                return crun_make_error (err, errno, "open `%s/%s`", destname, de->d_name);
-
-              sprintf (proc_path, "/proc/self/fd/%d", fd);
-              ret = chmod (proc_path, mode & ALLPERMS);
-            }
-
-          if (UNLIKELY (ret < 0))
-            return crun_make_error (err, errno, "chmod `%s/%s`", destname, de->d_name);
+          return crun_make_error (err, errno, "chmod `%s/%s`", destname, de->d_name);
         }
     }
 
   return 0;
-}
-
-const char *
-find_annotation_map (json_map_string_string *annotations, const char *name)
-{
-  size_t i;
-
-  if (annotations == NULL)
-    return NULL;
-
-  for (i = 0; i < annotations->len; i++)
-    {
-      if (strcmp (annotations->keys[i], name) == 0)
-        return annotations->values[i];
-    }
-  return NULL;
 }
 
 const char *
@@ -2081,18 +2209,13 @@ find_annotation (libcrun_container_t *container, const char *name)
   if (container->container_def->annotations == NULL)
     return NULL;
 
-  return find_annotation_map (container->container_def->annotations, name);
+  return find_string_map_value (container->annotations, name);
 }
 
-ssize_t
-safe_write (int fd, const void *buf, ssize_t count)
+int
+safe_write (int fd, const char *fname, const void *buf, size_t count, libcrun_error_t *err)
 {
-  ssize_t written = 0;
-  if (count < 0)
-    {
-      errno = EINVAL;
-      return -1;
-    }
+  size_t written = 0;
   while (written < count)
     {
       ssize_t w = write (fd, buf + written, count - written);
@@ -2100,11 +2223,11 @@ safe_write (int fd, const void *buf, ssize_t count)
         {
           if (errno == EINTR || errno == EAGAIN)
             continue;
-          return w;
+          return crun_make_error (err, errno, "write file `%s`", fname);
         }
       written += w;
     }
-  return written;
+  return 0;
 }
 
 int
@@ -2225,7 +2348,7 @@ base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t 
             }
         }
 
-      /* I have a entire block of data 32 bits get the output data.  */
+      /* I have an entire block of data 32 bits get the output data.  */
       if (i == 4)
         {
           *optr++ = (data[0] << 2) | ((data[1] & 0x30) >> 4);
@@ -2324,5 +2447,267 @@ libcrun_munmap (struct libcrun_mmap_s *mmap, libcrun_error_t *err)
 
   free (mmap);
 
+  return 0;
+}
+
+static long
+read_file_as_long_or_default (const char *path, long def_value)
+{
+  cleanup_free char *content = NULL;
+  libcrun_error_t tmp_err = NULL;
+  char *endptr;
+  long val;
+  int ret;
+
+  ret = read_all_file (path, &content, NULL, &tmp_err);
+  if (UNLIKELY (ret < 0))
+    {
+      crun_error_release (&tmp_err);
+      return def_value;
+    }
+
+  errno = 0;
+  val = strtol (content, &endptr, 10);
+  if (UNLIKELY (errno))
+    return def_value;
+  if (endptr == content || (*endptr && *endptr != '\n'))
+    return def_value;
+  return val;
+}
+
+#define DEFAULT_OVERFLOW_ID 65534
+
+uid_t
+get_overflow_uid (void)
+{
+  static atomic_long cached_uid = -1;
+  atomic_long uid = cached_uid;
+  if (uid == -1)
+    {
+      uid = read_file_as_long_or_default ("/proc/sys/kernel/overflowuid", DEFAULT_OVERFLOW_ID);
+      cached_uid = uid;
+    }
+  return uid;
+}
+
+gid_t
+get_overflow_gid (void)
+{
+  static atomic_long cached_gid = -1;
+  atomic_long gid = cached_gid;
+  if (gid == -1)
+    {
+      gid = read_file_as_long_or_default ("/proc/sys/kernel/overflowgid", DEFAULT_OVERFLOW_ID);
+      cached_gid = gid;
+    }
+  return gid;
+}
+
+void
+consume_trailing_slashes (char *path)
+{
+  if (! path || path[0] == '\0')
+    return;
+
+  char *last = path + strlen (path);
+
+  while (last > path && *(last - 1) == '/')
+    last--;
+
+  *last = '\0';
+}
+
+char **
+read_dir_entries (const char *path, libcrun_error_t *err)
+{
+  cleanup_dir DIR *dir = NULL;
+  size_t n_entries = 0;
+  size_t entries_size = 16;
+  char **entries = NULL;
+  struct dirent *de;
+
+  dir = opendir (path);
+  if (UNLIKELY (dir == NULL))
+    {
+      crun_make_error (err, errno, "opendir `%s`", path);
+      return NULL;
+    }
+
+  entries = xmalloc (entries_size * sizeof (char *));
+  while ((de = readdir (dir)))
+    {
+      if (strcmp (de->d_name, ".") == 0 || strcmp (de->d_name, "..") == 0)
+        continue;
+      if (n_entries == entries_size)
+        {
+          entries_size *= 2;
+          entries = xrealloc (entries, entries_size * sizeof (char *));
+        }
+      entries[n_entries++] = xstrdup (de->d_name);
+    }
+  entries = xrealloc (entries, (n_entries + 1) * sizeof (char *));
+  entries[n_entries] = NULL;
+
+  return entries;
+}
+
+int
+cpuset_string_to_bitmask (const char *str, char **out, size_t *out_size, libcrun_error_t *err)
+{
+  cleanup_free char *mask = NULL;
+  size_t mask_size = 0;
+  const char *p = str;
+  char *endptr;
+
+  while (*p)
+    {
+      long long start_range, end_range;
+
+      if (*p < '0' || *p > '9')
+        goto invalid_input;
+
+      start_range = strtoll (p, &endptr, 10);
+      if (start_range < 0)
+        goto invalid_input;
+
+      p = endptr;
+
+      if (*p != '-')
+        end_range = start_range;
+      else
+        {
+          p++;
+
+          if (*p < '0' || *p > '9')
+            goto invalid_input;
+
+          end_range = strtoll (p, &endptr, 10);
+
+          if (end_range < start_range)
+            goto invalid_input;
+
+          p = endptr;
+        }
+
+      /* Just set some limit.  */
+      if (end_range > (1 << 20))
+        goto invalid_input;
+
+      if (end_range >= (long long) (mask_size * CHAR_BIT))
+        {
+          size_t new_mask_size = (end_range / CHAR_BIT) + 1;
+          mask = xrealloc (mask, new_mask_size);
+          memset (mask + mask_size, 0, new_mask_size - mask_size);
+          mask_size = new_mask_size;
+        }
+
+      for (long long i = start_range; i <= end_range; i++)
+        mask[i / CHAR_BIT] |= (1 << (i % CHAR_BIT));
+
+      if (*p == ',')
+        p++;
+      else if (*p)
+        goto invalid_input;
+    }
+
+  *out = mask;
+  mask = NULL;
+  *out_size = mask_size;
+
+  return 0;
+
+invalid_input:
+  return crun_make_error (err, 0, "cannot parse input `%s`", str);
+}
+
+struct channel_fd_pair
+{
+  struct ring_buffer *rb;
+
+  int in_fd;
+  int out_fd;
+
+  int infd_epoll_events;
+  int outfd_epoll_events;
+};
+
+struct channel_fd_pair *
+channel_fd_pair_new (int in_fd, int out_fd, size_t size)
+{
+  struct channel_fd_pair *channel = xmalloc (sizeof (struct channel_fd_pair));
+  channel->in_fd = in_fd;
+  channel->out_fd = out_fd;
+  channel->infd_epoll_events = -1;
+  channel->outfd_epoll_events = -1;
+  channel->rb = ring_buffer_make (size);
+  return channel;
+}
+
+void
+channel_fd_pair_free (struct channel_fd_pair *channel)
+{
+  if (channel == NULL)
+    return;
+
+  ring_buffer_free (channel->rb);
+  free (channel);
+}
+
+int
+channel_fd_pair_process (struct channel_fd_pair *channel, int epollfd, libcrun_error_t *err)
+{
+  bool is_input_eagain = false, is_output_eagain = false, repeat;
+  int ret, i;
+
+  /* This function is called from an epoll loop.  Use a hard limit to avoid infinite loops
+     and prevent other events from being processed.  */
+  for (i = 0, repeat = true; i < 1000 && repeat; i++)
+    {
+      repeat = false;
+      if (ring_buffer_get_space_available (channel->rb) >= ring_buffer_get_size (channel->rb))
+        {
+          ret = ring_buffer_read (channel->rb, channel->in_fd, &is_input_eagain, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          if (ret > 0)
+            repeat = true;
+        }
+      if (ring_buffer_get_data_available (channel->rb) > 0)
+        {
+          ret = ring_buffer_write (channel->rb, channel->out_fd, &is_output_eagain, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          if (ret > 0)
+            repeat = true;
+        }
+    }
+
+  if (epollfd >= 0)
+    {
+      size_t available = ring_buffer_get_space_available (channel->rb);
+      size_t used = ring_buffer_get_data_available (channel->rb);
+      int events;
+
+      /* If there is space available in the buffer, we want to read more.  */
+      events = (available > 0) ? (EPOLLIN | (is_input_eagain ? EPOLLET : 0)) : 0;
+      if (events != channel->infd_epoll_events)
+        {
+          ret = epoll_helper_toggle (epollfd, channel->in_fd, events, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          channel->infd_epoll_events = events;
+        }
+
+      /* If there is data available in the buffer, we want to write as soon as
+         it is possible.  */
+      events = (used > 0) ? (EPOLLOUT | (is_output_eagain ? EPOLLET : 0)) : 0;
+      if (events != channel->outfd_epoll_events)
+        {
+          ret = epoll_helper_toggle (epollfd, channel->out_fd, events, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          channel->outfd_epoll_events = events;
+        }
+    }
   return 0;
 }

@@ -55,7 +55,7 @@ static struct argp_option options[] = { { "bundle", 'b', "DIR", 0, "path to the 
 static char args_doc[] = "spec";
 
 static error_t
-parse_opt (int key, char *arg arg_unused, struct argp_state *state arg_unused)
+parse_opt (int key, char *arg, struct argp_state *state)
 {
   switch (key)
     {
@@ -123,7 +123,7 @@ crun_command_spec (struct crun_global_arguments *global_args, int argc, char **a
         return libcrun_make_error (err, 0, "`%s` already exists", where);
     }
 
-  f = fopen (where, "w+");
+  f = fopen (where, "w+e");
   if (f == NULL)
     return libcrun_make_error (err, errno, "cannot open `%s`", where);
 

@@ -27,15 +27,20 @@ int
 wasm_can_handle_container (libcrun_container_t *container, libcrun_error_t *err arg_unused)
 {
   const char *annotation;
-  const char *entrypoint_executable = container->container_def->process->args[0];
+  const char *entrypoint_executable;
+
+  if (container->container_def->process == NULL || container->container_def->process->args == NULL)
+    return 0;
+
+  entrypoint_executable = container->container_def->process->args[0];
 
   annotation = find_annotation (container, "run.oci.handler");
   if (annotation)
     {
 
-      /* wasm-smart: annotation is a smart switch which only toggles wasm if its necessary,
-         following annotation is very useful for cases where users intends to run wasm workload on
-         kuberentes cluster but workload also contains side-cars which could execute non-wasm workload.
+      /* wasm-smart: annotation is a smart switch which only toggles wasm if it's necessary,
+         following annotation is very useful for cases where users intend to run wasm workload on
+         kubernetes cluster but workload also contains side-cars which could execute non-wasm workload.
          Example: Kubernetes clusters with service-mesh such as istio, linkerd etc
       */
       if (strcmp (annotation, "wasm-smart") == 0)
@@ -49,9 +54,9 @@ wasm_can_handle_container (libcrun_container_t *container, libcrun_error_t *err 
   if (annotation)
     {
 
-      /* compat-smart: annotation is a smart switch which only toggles wasm if its necessary,
-         following annotation is very useful for cases where users intends to run wasm workload on
-         kuberentes cluster but workload also contains side-cars which could execute non-wasm worload.
+      /* compat-smart: annotation is a smart switch which only toggles wasm if it's necessary,
+         following annotation is very useful for cases where users intend to run wasm workload on
+         kubernetes cluster but workload also contains side-cars which could execute non-wasm workload.
          Example: Kubernetes clusters with service-mesh such as istio, linkerd etc
       */
       if (strcmp (annotation, "compat-smart") == 0)

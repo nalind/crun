@@ -61,32 +61,32 @@ struct bpf_program
 #ifdef HAVE_EBPF
 
 #  define BPF_ALU32_IMM(OP, DST, IMM) \
-    ((struct bpf_insn){ .code = BPF_ALU | BPF_OP (OP) | BPF_K, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
+    ((struct bpf_insn) { .code = BPF_ALU | BPF_OP (OP) | BPF_K, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
 
 #  define BPF_LDX_MEM(SIZE, DST, SRC, OFF) \
-    ((struct bpf_insn){                    \
+    ((struct bpf_insn) {                   \
         .code = BPF_LDX | BPF_SIZE (SIZE) | BPF_MEM, .dst_reg = DST, .src_reg = SRC, .off = OFF, .imm = 0 })
 
 #  define BPF_MOV64_REG(DST, SRC) \
-    ((struct bpf_insn){ .code = BPF_ALU64 | BPF_MOV | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = 0, .imm = 0 })
+    ((struct bpf_insn) { .code = BPF_ALU64 | BPF_MOV | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = 0, .imm = 0 })
 
 #  define BPF_JMP_A(OFF) \
-    ((struct bpf_insn){ .code = BPF_JMP | BPF_JA, .dst_reg = 0, .src_reg = 0, .off = OFF, .imm = 0 })
+    ((struct bpf_insn) { .code = BPF_JMP | BPF_JA, .dst_reg = 0, .src_reg = 0, .off = OFF, .imm = 0 })
 
 #  define BPF_JMP_IMM(OP, DST, IMM, OFF) \
-    ((struct bpf_insn){ .code = BPF_JMP | BPF_OP (OP) | BPF_K, .dst_reg = DST, .src_reg = 0, .off = OFF, .imm = IMM })
+    ((struct bpf_insn) { .code = BPF_JMP | BPF_OP (OP) | BPF_K, .dst_reg = DST, .src_reg = 0, .off = OFF, .imm = IMM })
 
 #  define BPF_JMP_REG(OP, DST, SRC, OFF) \
-    ((struct bpf_insn){ .code = BPF_JMP | BPF_OP (OP) | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = OFF, .imm = 0 })
+    ((struct bpf_insn) { .code = BPF_JMP | BPF_OP (OP) | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = OFF, .imm = 0 })
 
 #  define BPF_MOV64_IMM(DST, IMM) \
-    ((struct bpf_insn){ .code = BPF_ALU64 | BPF_MOV | BPF_K, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
+    ((struct bpf_insn) { .code = BPF_ALU64 | BPF_MOV | BPF_K, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
 
 #  define BPF_MOV32_REG(DST, SRC) \
-    ((struct bpf_insn){ .code = BPF_ALU | BPF_MOV | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = 0, .imm = 0 })
+    ((struct bpf_insn) { .code = BPF_ALU | BPF_MOV | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = 0, .imm = 0 })
 
 #  define BPF_EXIT_INSN() \
-    ((struct bpf_insn){ .code = BPF_JMP | BPF_EXIT, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0 })
+    ((struct bpf_insn) { .code = BPF_JMP | BPF_EXIT, .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0 })
 #endif
 
 #ifdef HAVE_EBPF
@@ -447,6 +447,30 @@ ebpf_attach_program (int fd, int dirfd, libcrun_error_t *err)
 #endif
 }
 
+static void
+bump_memlock ()
+{
+  struct rlimit limit;
+  int ret;
+
+  limit.rlim_cur = RLIM_INFINITY;
+  limit.rlim_max = RLIM_INFINITY;
+
+  ret = setrlimit (RLIMIT_MEMLOCK, &limit);
+  if (ret == 0)
+    return;
+
+  /* If the above failed, try to set the current limit
+     to the max configured.  */
+  ret = getrlimit (RLIMIT_MEMLOCK, &limit);
+  if (ret < 0)
+    return;
+
+  limit.rlim_cur = limit.rlim_max;
+  /* Best effort, ignore errors.  */
+  (void) setrlimit (RLIMIT_MEMLOCK, &limit);
+}
+
 int
 libcrun_ebpf_load (struct bpf_program *program, int dirfd, const char *pin, libcrun_error_t *err)
 {
@@ -460,14 +484,7 @@ libcrun_ebpf_load (struct bpf_program *program, int dirfd, const char *pin, libc
 #else
   cleanup_close int fd = -1;
   union bpf_attr attr;
-  struct rlimit limit;
   int ret;
-
-  limit.rlim_cur = RLIM_INFINITY;
-  limit.rlim_max = RLIM_INFINITY;
-  ret = setrlimit (RLIMIT_MEMLOCK, &limit);
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "setrlimit (RLIM_MEMLOCK)");
 
   memset (&attr, 0, sizeof (attr));
   attr.prog_type = BPF_PROG_TYPE_CGROUP_DEVICE;
@@ -479,9 +496,19 @@ libcrun_ebpf_load (struct bpf_program *program, int dirfd, const char *pin, libc
   fd = bpf (BPF_PROG_LOAD, &attr, sizeof (attr));
   if (fd < 0)
     {
-      const size_t log_size = 8192;
-      cleanup_free char *log = xmalloc (log_size);
+      /* Prior to Linux 5.11, eBPF programs were accounted to the memlock
+         prlimit.  Attempt to bump the limit, if possible.  */
+      bump_memlock ();
+      fd = bpf (BPF_PROG_LOAD, &attr, sizeof (attr));
+    }
+  if (fd < 0)
+    {
+      const size_t max_log_size = 1 << 20;
+      cleanup_free char *log = NULL;
+      size_t log_size = 8192;
 
+    retry:
+      log = xrealloc (log, log_size);
       log[0] = '\0';
       attr.log_level = 1;
       attr.log_buf = ptr_to_u64 (log);
@@ -489,7 +516,15 @@ libcrun_ebpf_load (struct bpf_program *program, int dirfd, const char *pin, libc
 
       fd = bpf (BPF_PROG_LOAD, &attr, sizeof (attr));
       if (fd < 0)
-        return crun_make_error (err, errno, "bpf create `%s`", log);
+        {
+          if (errno == ENOSPC && log_size < max_log_size)
+            {
+              /* The provided buffer was not big enough.  */
+              log_size *= 2;
+              goto retry;
+            }
+          return crun_make_error (err, errno, "bpf create `%s`", log);
+        }
     }
 
   ret = ebpf_attach_program (fd, dirfd, err);

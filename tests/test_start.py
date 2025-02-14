@@ -369,8 +369,8 @@ def test_sd_notify_proxy():
     if is_rootless():
         return 77
 
-    has_open_tree_status = subprocess.call(["./tests/init", "check-feature", "open_tree"])
-    has_move_mount_status = subprocess.call(["./tests/init", "check-feature", "move_mount"])
+    has_open_tree_status = subprocess.call([get_init_path(), "check-feature", "open_tree"])
+    has_move_mount_status = subprocess.call([get_init_path(), "check-feature", "move_mount"])
     if has_open_tree_status != 0 or has_move_mount_status != 0:
         return 77
 
@@ -462,6 +462,100 @@ def test_listen_pid_env():
         return -1
     return 0
 
+def test_ioprio():
+    IOPRIO_CLASS_NONE = 0
+    IOPRIO_CLASS_RT = 1
+    IOPRIO_CLASS_BE = 2
+    IOPRIO_CLASS_IDLE = 3
+
+    IOPRIO_CLASS_SHIFT = 13
+    IOPRIO_CLASS_MASK = 0x07
+    IOPRIO_PRIO_MASK = (1 << IOPRIO_CLASS_SHIFT) - 1
+
+    supported = subprocess.call([get_init_path(), "check-feature", "ioprio"])
+    if supported != 0:
+        return 77
+
+    conf = base_config()
+    add_all_namespaces(conf, netns=False)
+
+    conf['process']['args'] = ['/init', 'ioprio']
+    conf['process']['ioPriority'] = {
+        "class": "IOPRIO_CLASS_IDLE",
+        "priority": 0
+    }
+
+    cid = None
+    try:
+        output, cid = run_and_get_output(conf, command='run')
+        value = int(output)
+        if ((value >> IOPRIO_CLASS_SHIFT) & IOPRIO_CLASS_MASK) != IOPRIO_CLASS_IDLE:
+            print("invalid ioprio class returned")
+            return 1
+        if value & IOPRIO_PRIO_MASK != 0:
+            print("invalid ioprio priority returned")
+            return 1
+        return 0
+    except Exception as e:
+        return 1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+def test_run_keep():
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'cat', '/dev/null']
+    add_all_namespaces(conf)
+    try:
+        out, cid = run_and_get_output(conf, command='run')
+    except:
+        sys.stderr.write("failed to create container\n")
+        return -1
+
+    # without --keep, we must be able to recreate the container with the same id
+    try:
+        out, cid = run_and_get_output(conf, command='run', keep=True, id_container=cid)
+    except:
+        sys.stderr.write("failed to create container\n")
+        return -1
+
+    # now it must fail
+    try:
+        try:
+            out, cid = run_and_get_output(conf, command='run', keep=True, id_container=cid)
+            sys.stderr.write("run --keep succeeded twice\n")
+            return -1
+        except:
+            # expected
+            pass
+
+        try:
+            s = run_crun_command(["state", cid])
+        except:
+            sys.stderr.write("crun state failed on --keep container\n")
+            return -1
+    finally:
+        run_crun_command(["delete", "-f", cid])
+
+    return 0
+
+def test_invalid_id():
+    conf = base_config()
+    conf['process']['args'] = ['./init', 'echo', 'hello']
+    conf['process']['cwd'] = "/sbin"
+    add_all_namespaces(conf)
+    try:
+        out, _ = run_and_get_output(conf, id_container="this/is/invalid")
+        return -1
+    except Exception as e:
+        err = e.output.decode()
+        if "invalid character `/` in the ID" in err:
+            return 0
+        sys.stderr.write("Got error: %s\n" % err)
+        return -1
+    return 0
+
 all_tests = {
     "start" : test_start,
     "start-override-config" : test_start_override_config,
@@ -482,6 +576,9 @@ all_tests = {
     "not-allowed-net-sysctl": test_not_allowed_net_sysctl,
     "uts-sysctl": test_uts_sysctl,
     "unknown-sysctl": test_unknown_sysctl,
+    "ioprio": test_ioprio,
+    "run-keep": test_run_keep,
+    "invalid-id": test_invalid_id,
 }
 
 if __name__ == "__main__":

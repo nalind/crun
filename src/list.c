@@ -64,7 +64,7 @@ static struct argp_option options[]
 static char args_doc[] = "list";
 
 static error_t
-parse_opt (int key, char *arg arg_unused, struct argp_state *state arg_unused)
+parse_opt (int key, char *arg, struct argp_state *state arg_unused)
 {
   switch (key)
     {
@@ -97,7 +97,7 @@ crun_command_list (struct crun_global_arguments *global_args, int argc, char **a
   libcrun_context_t crun_context = {
     0,
   };
-  libcrun_container_list_t *list, *it;
+  libcrun_container_list_t *list = NULL, *it;
 
   list_options.format = LIST_TABLE;
 

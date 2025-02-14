@@ -21,7 +21,11 @@
 #include "container.h"
 #include <unistd.h>
 
-int parse_sd_array (char *s, char **out, char **next, libcrun_error_t *err);
+#ifdef HAVE_SYSTEMD
+extern int parse_sd_array (char *s, char **out, char **next, libcrun_error_t *err);
+
+extern char *get_cgroup_scope_path (const char *cgroup_path, const char *scope);
+#endif
 
 extern struct libcrun_cgroup_manager cgroup_manager_systemd;
 
