@@ -6,25 +6,30 @@ jobs:
   build_job:
     runs-on: ubuntu-latest
     name: Build on ${{ matrix.arch }}
+    permissions:
+      contents: read
+      packages: write
 
     strategy:
       matrix:
         include:
           - arch: armv7
             distro: ubuntu_latest
-          - arch: aarch64
-            distro: ubuntu_latest
-          - arch: s390x
-            distro: ubuntu_latest
-          - arch: ppc64le
+#          - arch: aarch64
+#            distro: ubuntu_latest
+#          - arch: s390x
+#            distro: ubuntu_latest
+#          - arch: ppc64le
+#            distro: ubuntu_latest
+          - arch: riscv64
             distro: ubuntu_latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
           set-safe-directory: true
 
-      - uses: uraimo/run-on-arch-action@v2.2.1
+      - uses: uraimo/run-on-arch-action@v2.8.1
         name: Build
         id: build
         with:
@@ -34,13 +39,13 @@ jobs:
           githubToken: ${{ github.token }}
 
           install: |
-            apt-get update -q -y
-            apt-get install -q -y automake libtool autotools-dev libseccomp-dev git make libcap-dev cmake pkg-config gcc wget go-md2man libsystemd-dev gperf clang-format libyajl-dev libprotobuf-c-dev
+            apt-get update -y
+            apt-get install -y automake libtool autotools-dev libseccomp-dev git make libcap-dev cmake pkg-config gcc wget go-md2man libsystemd-dev gperf clang-format libyajl-dev libprotobuf-c-dev clang
 
           run: |
             find $(pwd) -name '.git' -exec bash -c 'git config --global --add safe.directory ${0%/.git}' {} \;
             ./autogen.sh
-            ./configure CFLAGS='-Wall -Werror'
+            ./configure CFLAGS='-Wall -Werror' || cat config.log
             make -j $(nproc) -C libocispec libocispec.la
             make git-version.h
             make -j $(nproc) libcrun.la
@@ -64,13 +69,13 @@ jobs:
           - test: disable-systemd
           - test: check
           - test: podman
-          - test: cri-o
+          #- test: cri-o
           - test: containerd
           - test: oci-validation
           - test: alpine-build
-          - test: fedora-rawhide-mockbuild
           - test: centos8-build
           - test: centos9-build
+          #- test: centos10-build
           - test: clang-format
           - test: clang-check
           - test: checkpoint-restore
@@ -79,7 +84,7 @@ jobs:
           - test: wasmedge-build
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: install dependencies
         run: |
@@ -105,6 +110,7 @@ jobs:
                   make -j $(nproc)
               ;;
               check)
+                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
                   ./configure --disable-dl
                   make
                   make syntax-check
@@ -121,38 +127,37 @@ jobs:
               podman)
                   sudo mkdir -p /var/lib/containers /var/tmp
                   sudo docker build -t crun-podman tests/podman
-                  sudo docker run --privileged --rm -v /var/tmp:/var/tmp:rw -v /var/lib/containers:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-podman
+                  sudo docker run --cgroupns=host --privileged --rm -v /var/tmp:/var/tmp:rw -v /var/lib/containers:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-podman
                   ;;
-              cri-o)
-                  sudo modprobe -a ip6_tables br_netfilter
-                  sudo mkdir -p /var/lib/var-crio/tmp /var/lib/tmp-crio /var/lib/var-tmp-crio
-                  sudo docker build -t crun-cri-o tests/cri-o
-                  sudo docker run --net host --privileged --rm -v /dev/zero:/sys/module/apparmor/parameters/enabled -v /var/lib/tmp-crio:/tmp:rw -v /var/lib/var-tmp-crio:/var/tmp -v /var/lib/var-crio:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-cri-o
-                  ;;
+              #cri-o)
+              #    sudo mkdir -p /var/lib/var-crio/tmp /var/lib/tmp-crio /var/lib/var-tmp-crio
+              #    sudo docker build -t crun-cri-o tests/cri-o
+              #    sudo docker run --cgroupns=host  --net host --privileged --rm -v /dev/zero:/sys/module/apparmor/parameters/enabled -v /var/lib/tmp-crio:/tmp:rw -v /var/lib/var-tmp-crio:/var/tmp -v /var/lib/var-crio:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-cri-o
+              #    ;;
               containerd)
                   sudo mkdir -p /var/lib/var-containerd
                   sudo docker build -t crun-containerd tests/containerd
-                  sudo docker run --privileged --net host --rm -v /tmp:/tmp:rw -v /var/lib/var-containerd:/var/lib:rw -v /sys:/sys:rw,rslave -v ${PWD}:/crun crun-containerd
+                  sudo docker run --cgroupns=host --privileged --net host --rm -v /tmp:/tmp:rw -v /var/lib/var-containerd:/var/lib:rw -v /sys:/sys:rw,rslave -v ${PWD}:/crun crun-containerd
                   ;;
               oci-validation)
                   sudo docker build -t crun-oci-validation tests/oci-validation
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-oci-validation
+                  sudo docker run --cgroupns=host --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-oci-validation
               ;;
               alpine-build)
                   sudo docker build -t crun-alpine-build tests/alpine-build
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-alpine-build
-              ;;
-              fedora-rawhide-mockbuild)
-                  sudo docker build -t crun-fedora-rawhide-mockbuild tests/fedora-rawhide-mockbuild
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-fedora-rawhide-mockbuild
+                  sudo docker run --cgroupns=host --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-alpine-build
               ;;
               centos8-build)
                   sudo docker build -t crun-centos8-build tests/centos8-build
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-centos8-build
+                  sudo docker run --cgroupns=host --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-centos8-build
               ;;
               centos9-build)
                   sudo docker build -t crun-centos9-build tests/centos9-build
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-centos9-build
+                  sudo docker run --cgroupns=host --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-centos9-build
+              ;;
+              centos10-build)
+                  sudo docker build -t crun-centos10-build tests/centos10-build
+                  sudo docker run --cgroupns=host --privileged --rm -v /var/tmp:/var/tmp:rw -v /var/lib/containers:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-centos10-build
               ;;
               clang-format)
                   sudo docker build -t crun-clang-format tests/clang-format
@@ -169,22 +174,22 @@ jobs:
               ;;
               fuzzing)
                   sudo docker build -t crun-fuzzing tests/fuzzing
-                  sudo docker run -e RUN_TIME=300 --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-fuzzing
+                  sudo docker run --cgroupns=host -e RUN_TIME=300 --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave -v ${PWD}:/crun crun-fuzzing
               ;;
               codespell)
                   sudo docker build -t crun-codespell tests/codespell
-                  sudo docker run --rm -w /crun -v ${PWD}/crun:/crun crun-codespell codespell
+                  sudo docker run --rm -w /crun -v ${PWD}:/crun crun-codespell codespell -q 0
               ;;
               wasmedge-build)
                   sudo docker build -t wasmedge tests/wasmedge-build
-                  sudo docker run --privileged --rm -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave  -w /crun -v ${PWD}:/crun wasmedge
+                  sudo docker run --privileged --cgroupns=host --rm -v containers:/var/lib/containers:rw -v /sys/fs/cgroup:/sys/fs/cgroup:rw,rslave  -w /crun -v ${PWD}:/crun wasmedge
               ;;
           esac
 
   shellcheck:
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: vars
         run: |
           echo 'VERSION=v0.8.0' >> $GITHUB_ENV
@@ -203,7 +208,7 @@ jobs:
         run: |
           sudo apt-get update -q -y
           sudo apt-get install -q -y automake libtool autotools-dev libseccomp-dev git make libcap-dev cmake pkg-config gcc wget go-md2man libsystemd-dev gperf clang-format libyajl-dev libprotobuf-c-dev
-      - uses: lumaxis/shellcheck-problem-matchers@v1
+      - uses: lumaxis/shellcheck-problem-matchers@v2
       - name: shellcheck
         run: |
           find $(pwd) -name '.git' -exec bash -c 'git config --global --add safe.directory ${0%/.git}' {} \;

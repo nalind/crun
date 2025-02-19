@@ -8,6 +8,8 @@ AC_CONFIG_MACRO_DIR([m4])
 AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_CONFIG_SRCDIR([src/crun.c])
 
+AC_PROG_LN_S
+
 LT_INIT([disable-shared])
 
 AM_INIT_AUTOMAKE([1.11.2 -Wno-portability foreign tar-ustar no-dist-gzip dist-xz subdir-objects])
@@ -24,9 +26,34 @@ AC_PATH_PROG(MD2MAN, go-md2man)
 
 AM_CONDITIONAL([HAVE_MD2MAN], [test "x$ac_cv_path_MD2MAN" != x])
 
-AC_CHECK_HEADERS([error.h linux/openat2.h stdatomic.h])
+AC_CHECK_HEADERS([error.h linux/openat2.h stdatomic.h linux/ioprio.h])
 
-AC_CHECK_FUNCS(copy_file_range fgetxattr statx fgetpwent_r issetugid)
+AC_CHECK_TYPES([atomic_int], [], [], [[#include <stdatomic.h>]])
+
+AC_CHECK_FUNCS(eaccess hsearch_r copy_file_range fgetxattr statx fgetpwent_r issetugid memfd_create)
+
+AC_ARG_ENABLE(crun,
+AS_HELP_STRING([--enable-crun], [Include crun executable in installation (default: yes)]),
+[
+case "${enableval}" in
+	yes) enable_crun=true ;;
+	no) enable_crun=false ;;
+	*) AC_MSG_ERROR(bad value $(enableval) for --disable-crun) ;;
+esac],
+[enable_crun=true])
+AM_CONDITIONAL([ENABLE_CRUN], [test "x${enable_crun}" = xtrue])
+
+AC_ARG_ENABLE(libcrun,
+AS_HELP_STRING([--enable-libcrun], [Include libcrun in installation (default: yes)]),
+[
+case "${enableval}" in
+	yes) enable_libcrun=true ;;
+	no) enable_libcrun=false ;;
+	*) AC_MSG_ERROR(bad value ${enablevaal} for --enable-libcrun) ;;
+esac
+],
+[enable_libcrun=true])
+AM_CONDITIONAL([ENABLE_LIBCRUN], [test "x${enable_libcrun}" = xtrue])
 
 dnl embedded yajl
 AC_ARG_ENABLE(embedded-yajl,
@@ -97,9 +124,23 @@ dnl include support for wasmedge (EXPERIMENTAL)
 AC_ARG_WITH([wasmedge], AS_HELP_STRING([--with-wasmedge], [build with WasmEdge support]))
 AS_IF([test "x$with_wasmedge" = "xyes"], AC_CHECK_HEADERS([wasmedge/wasmedge.h], AC_DEFINE([HAVE_WASMEDGE], 1, [Define if WasmEdge is available]), [AC_MSG_ERROR([*** Missing wasmedge headers])]))
 
+dnl include support for wamr (EXPERIMENTAL)
+AC_ARG_WITH([wamr], AS_HELP_STRING([--with-wamr], [build with WAMR support]))
+AS_IF([test "x$with_wamr" = "xyes"], AC_CHECK_HEADERS([wasm_export.h], AC_DEFINE([HAVE_WAMR], 1, [Define if WAMR is available]), [AC_MSG_ERROR([*** Missing WAMR headers])]))
+
 dnl include support for libkrun (EXPERIMENTAL)
 AC_ARG_WITH([libkrun], AS_HELP_STRING([--with-libkrun], [build with libkrun support]))
 AS_IF([test "x$with_libkrun" = "xyes"], AC_CHECK_HEADERS([libkrun.h], AC_DEFINE([HAVE_LIBKRUN], 1, [Define if libkrun is available]), [AC_MSG_ERROR([*** Missing libkrun headers])]))
+
+AM_CONDITIONAL([ENABLE_KRUN], [test "x$with_libkrun" = xyes])
+
+AM_CONDITIONAL([ENABLE_WASM], [test "x$with_wasmer" = xyes || test "x$with_wasmedge" = xyes || test "x$with_wasmtime" = xyes])
+
+dnl include support for spin (EXPERIMENTAL)
+AC_ARG_WITH([spin], AS_HELP_STRING([--with-spin], [build with spin support]))
+AS_IF([test "x$with_spin" = "xyes"], AC_DEFINE([HAVE_SPIN], 1, [Define if spin is available]))
+
+
 dnl libseccomp
 AC_ARG_ENABLE([seccomp],
 	AS_HELP_STRING([--disable-seccomp], [Ignore libseccomp and disable support]))
@@ -170,6 +211,31 @@ AS_IF([test "x$with_python_bindings" = "xyes"], [
         use_fPIC=yes
 ])
 
+AC_ARG_WITH([lua-bindings], AS_HELP_STRING([--with-lua-bindings], [build the Lua bindings]))
+
+AC_ARG_ENABLE(
+	[lua-path-guessing],
+	AS_HELP_STRING([--enable-lua-path-guessing], [guessing lua module path based on variables (default: yes), disable to use libdir as luaexecdir]),
+[
+case "${enableval}" in
+	yes) enable_lua_path_guessing=true ;;
+	no) enable_lua_path_guessing=false ;;
+	*) AC_MSG_ERROR(bad value ${enablevaal} for --enable-lua-path-guessing) ;;
+esac
+],
+[enable_lua_path_guessing=true]
+)
+
+AS_IF([test "x$with_lua_bindings" = "xyes"], [
+	AX_PROG_LUA([5.4], [5.5], [], [AC_MSG_ERROR([*** lua interpreter not found])])
+	AX_LUA_HEADERS([], [AC_MSG_ERROR([*** lua headers not found])])
+	AX_LUA_LIBS([], [AC_MSG_ERROR([*** lua libs not found])])
+	AS_IF([test "x$enable_lua_path_guessing" = "xfalse"], [
+		AC_SUBST([luaexecdir], [$libdir])
+	])
+	use_fPIC=yes
+])
+
 AS_IF([test "x$use_fPIC" = "xyes"], [
 	# configure should not touch CFLAGS/LDFLAGS but we need it to propagate it
 	# to libocispec.
@@ -186,9 +252,10 @@ AS_IF([test "x$enable_criu" != "xno"], [
 	        AC_MSG_NOTICE([CRIU version doesn't support join-ns API])])
 	PKG_CHECK_MODULES([CRIU_PRE_DUMP], [criu > 3.16.1], [have_criu_pre_dump="yes"], [have_criu_pre_dump="no"
 	        AC_MSG_NOTICE([CRIU version doesn't support for pre-dumping])])
+	PKG_CHECK_MODULES([CRIU_NETWORK_LOCK_SKIP], [criu >= 3.19], [have_criu_network_lock_skip="yes"], [have_criu_network_lock_skip="no"
+	        AC_MSG_NOTICE([CRIU version doesn't support CRIU_NETWORK_LOCK_SKIP])])
 	AS_IF([test "$have_criu" = "yes"], [
 		AC_DEFINE([HAVE_CRIU], 1, [Define if CRIU is available])
-		AC_SEARCH_LIBS(criu_init_opts, [criu])
 	])
 	AS_IF([test "$have_criu_join_ns" = "yes"], [
 		AC_DEFINE([CRIU_JOIN_NS_SUPPORT], 1, [Define if CRIU join NS support is available])
@@ -196,6 +263,10 @@ AS_IF([test "x$enable_criu" != "xno"], [
 	AS_IF([test "$have_criu_pre_dump" = "yes"], [
 		AC_DEFINE([CRIU_PRE_DUMP_SUPPORT], 1, [Define if CRIU pre-dump support is available])
 	])
+	AS_IF([test "$have_criu_network_lock_skip" = "yes"], [
+		AC_DEFINE([CRIU_NETWORK_LOCK_SKIP_SUPPORT], 1, [Define if CRIU_NETWORK_LOCK_SKIP is available])
+	])
+
 ], [AC_MSG_NOTICE([CRIU support disabled per user request])])
 
 FOUND_LIBS=$LIBS
@@ -251,10 +322,11 @@ fi
 AC_SEARCH_LIBS([argp_parse], [argp], [], [AC_MSG_ERROR([*** argp functions not found - install libargp or argp_standalone])])
 
 AM_CONDITIONAL([PYTHON_BINDINGS], [test "x$with_python_bindings" = "xyes"])
+AM_CONDITIONAL([LUA_BINDINGS], [test "x$with_lua_bindings" = "xyes"])
 AM_CONDITIONAL([CRIU_SUPPORT], [test "x$have_criu" = "xyes"])
 AM_CONDITIONAL([SHARED_LIBCRUN], [test "x$enable_shared" = "xyes"])
 
-AC_CONFIG_FILES([Makefile rpm/crun.spec])
+AC_CONFIG_FILES([Makefile])
 
 AC_CONFIG_SUBDIRS([libocispec])
 AC_OUTPUT

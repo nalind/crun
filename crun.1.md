@@ -60,11 +60,10 @@ Resume the processes in the container.
 Update container resource constraints.
 
 **checkpoint**
-Checkpoint a running container using CRIU
+Checkpoint a running container using CRIU.
 
 **restore**
-Restore a container from a checkpoint
-
+Restore a container from a checkpoint.
 # STATE
 
 By default, when running as root user, crun saves its state under the
@@ -98,6 +97,10 @@ If no backend is specified, then *file:* is used by default.
 **--log-format**=_FORMAT_
 Define the format of the log messages.  It can either be **text**, or
 **json**.  The default is **text**.
+
+**--log-level**=_LEVEL_
+Define the log level.  It can either be **debug**, **warning** or **error**.
+The default is **error**.
 
 **--no-pivot**
 Use `chroot(2)` instead of `pivot_root(2)` when creating the container.
@@ -387,7 +390,30 @@ Where to write the PID of the container
 Specify which CRIU manage cgroup mode should be used. Permitted values are
 **soft**, **ignore**, **full** or **strict**. Default is **soft**.
 
+**--lsm-profile**=_TYPE_:_NAME_
+Specify an LSM profile to be used during restore.
+_TYPE_ can be either **apparmor** or **selinux**.
+
+**--lsm-mount-context**=_VALUE_
+Specify a new LSM mount context to be used during restore.
+This option replaces an existing mount context information
+with the specified value. This is useful when restoring
+a container into an existing Pod and selinux labels
+need to be changed during restore.
+
 # Extensions to OCI
+
+## `run.oci.mount_context_type=context`
+
+Set the mount context type on volumes mounted with SELinux labels.
+
+Valid context types are:
+  context (default)
+  fscontext
+  defcontext
+  rootcontext
+
+More information on how the context mount flags works see the `mount(8)` man page.
 
 ## `run.oci.seccomp.receiver=PATH`
 
@@ -402,7 +428,7 @@ it is supported in the OCI runtime specs.  It must be an absolute path.
 If the annotation `run.oci.seccomp.plugins=PLUGIN1[:PLUGIN2]...` is specified, the
 seccomp listener fd is handled through the specified plugins.  The
 plugin must either be an absolute path or a file name that is looked
-up by `ldopen(3)`.  More information on how the lookup is performed
+up by `dlopen(3)`.  More information on how the lookup is performed
 are available on the `ld.so(8)` man page.
 
 ## `run.oci.seccomp_fail_unknown_syscall=1`
@@ -427,6 +453,14 @@ will skip the `setgroups` syscall that is used to either set the
 additional groups specified in the OCI configuration, or to reset the
 list of additional groups if none is specified.
 
+## `run.oci.pidfd_receiver=PATH`
+
+It is an experimental feature and will be removed once the feature is in the
+OCI runtime specs.
+
+If present, specify the path to the UNIX socket that will receive the
+pidfd for the container process.
+
 ## `run.oci.systemd.force_cgroup_v1=/PATH`
 
 If the annotation `run.oci.systemd.force_cgroup_v1=/PATH` is present, then crun
@@ -446,11 +480,6 @@ mkdir /sys/fs/cgroup/systemd
 mount cgroup -t cgroup /sys/fs/cgroup/systemd -o none,name=systemd,xattr
 chown -R the_user.the_user /sys/fs/cgroup/systemd
 ```
-
-## `run.oci.timens_offset=ID SEC NSEC`
-
-Specify the offset to be written to /proc/self/timens_offsets when creating
-a time namespace.
 
 ## `run.oci.systemd.subgroup=SUBGROUP`
 
@@ -512,22 +541,29 @@ doesn't already exist.
 It is an experimental feature.
 
 If specified, run the specified handler for execing the container.
-The only supported value is `krun`.  When `krun` is specified, the
-`libkrun.so` shared object is loaded and it is used to launch the
-container using libkrun.
+The only supported values are `krun` and `wasm`.
 
-## `run.oci.handler=wasm`
+- `krun`: When `krun` is specified, the `libkrun.so` shared object is loaded
+and it is used to launch the container using libkrun.
 
-If specified, run the wasm handler for container.
-Allows running wasm workload natively. Accepts a `.wasm` binary as input
-and if `.wat` is provided it will automatically compiled into a wasm module.
-Stdout of wasm module is relayed back via crun.
+- `wasm`: If specified, run the wasm handler for container. Allows running wasm
+workload natively. Accepts a `.wasm` binary as input and if `.wat` is
+provided it will be automatically compiled into a wasm module. Stdout of
+wasm module is relayed back via crun.
 
 ## tmpcopyup mount options
 
 If the `tmpcopyup` option is specified for a tmpfs, then the path that
 is shadowed by the tmpfs mount is recursively copied up to the tmpfs
 itself.
+
+## copy-symlink mount options
+
+If the `copy-symlink` option is specified, if the source of a bind
+mount is a symlink, the symlink is recreated at the specified
+destination instead of attempting a mount that would resolve the
+symlink itself.  If the destination already exists and it is not a
+symlink with the expected content, crun will return an error.
 
 ## r$FLAG mount options
 
@@ -611,8 +647,8 @@ For example, the mapping: `uids=@1-3-10`, given a configuration like
 ```
 
 will be converted to the absolute value `uids=1-4-10`, where 4 is
-calculated by adding 3 (container ID in the `uids=` mapping)
-+ 1 (`hostID - containerID` for the user namespace mapping where
+calculated by adding 3 (container ID in the `uids=` mapping) and 1
+(`hostID - containerID` for the user namespace mapping where
 `containerID = 1` is found).
 
 The current implementation doesn't take into account multiple
@@ -627,6 +663,10 @@ automatically created even if it is not specified in the config file.
 The current user is mapped to the ID 0 in the container, and any
 additional id specified in the files `/etc/subuid` and `/etc/subgid`
 is automatically added starting with ID 1.
+
+# CGROUP v1
+
+Support for cgroup v1 is deprecated and will be removed in a future release.
 
 # CGROUP v2
 
