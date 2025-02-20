@@ -27,8 +27,10 @@
 #include <errno.h>
 #include <sys/param.h>
 #include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <ocispec/runtime_spec_schema_config_schema.h>
 
 #ifdef HAVE_DLOPEN
 #  include <dlfcn.h>
@@ -40,6 +42,8 @@
 
 /* libkrun has a hard-limit of 8 vCPUs per microVM. */
 #define LIBKRUN_MAX_VCPUS 8
+
+#define KRUN_CONFIG_FILE ".krun_config.json"
 
 struct krun_config
 {
@@ -68,6 +72,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   uint32_t num_vcpus, ram_mib;
   int32_t ctx_id, ret;
   cpu_set_t set;
+  char *const envp[] = { 0 };
 
   if (access ("/krun-sev.json", F_OK) == 0)
     {
@@ -96,7 +101,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
 
   ctx_id = krun_create_ctx ();
   if (UNLIKELY (ctx_id < 0))
-    error (EXIT_FAILURE, -ret, "could not create krun context");
+    error (EXIT_FAILURE, -ctx_id, "could not create krun context");
 
   if (kconf->sev)
     {
@@ -151,12 +156,12 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
             error (EXIT_FAILURE, -ret, "could not set krun working directory");
         }
 
-      ret = krun_set_exec (ctx_id, pathname, &argv[1], NULL);
+      ret = krun_set_exec (ctx_id, pathname, &argv[1], &envp[0]);
       if (UNLIKELY (ret < 0))
         error (EXIT_FAILURE, -ret, "could not set krun executable");
     }
-
-  return krun_start_enter (ctx_id);
+  ret = krun_start_enter (ctx_id);
+  return -ret;
 }
 
 /* libkrun_create_kvm_device: explicitly adds kvm device.  */
@@ -173,8 +178,48 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
   cleanup_close int devfd = -1;
   cleanup_close int rootfsfd_cleanup = -1;
   runtime_spec_schema_config_schema *def = container->container_def;
+  bool create_sev = false;
   bool is_user_ns;
-  bool create_sev;
+
+  if (rootfs == NULL)
+    rootfsfd = AT_FDCWD;
+  else
+    {
+      rootfsfd = rootfsfd_cleanup = open (rootfs, O_PATH | O_CLOEXEC);
+      if (UNLIKELY (rootfsfd < 0))
+        return crun_make_error (err, errno, "open `%s`", rootfs);
+    }
+
+  if (phase == HANDLER_CONFIGURE_BEFORE_MOUNTS)
+    {
+      cleanup_free char *origin_config_path = NULL;
+      cleanup_free char *state_dir = NULL;
+      cleanup_free char *config = NULL;
+      cleanup_close int fd = -1;
+      size_t config_size;
+
+      ret = libcrun_get_state_directory (&state_dir, context->state_root, context->id, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = append_paths (&origin_config_path, err, state_dir, "config.json", NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = read_all_file (origin_config_path, &config, &config_size, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      /* CVE-2025-24965: the content below rootfs cannot be trusted because it is controlled by the user.  We
+         must ensure the file is opened below the rootfs directory.  */
+      fd = safe_openat (rootfsfd, rootfs, KRUN_CONFIG_FILE, WRITE_FILE_DEFAULT_FLAGS | O_NOFOLLOW, 0700, err);
+      if (UNLIKELY (fd < 0))
+        return fd;
+
+      ret = safe_write (fd, KRUN_CONFIG_FILE, config, config_size, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
 
   if (phase != HANDLER_CONFIGURE_AFTER_MOUNTS)
     return 0;
@@ -196,16 +241,7 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
         }
     }
 
-  if (rootfs == NULL)
-    rootfsfd = AT_FDCWD;
-  else
-    {
-      rootfsfd = rootfsfd_cleanup = open (rootfs, O_PATH);
-      if (UNLIKELY (rootfsfd < 0))
-        return crun_make_error (err, errno, "open `%s`", rootfs);
-    }
-
-  devfd = openat (rootfsfd, "dev", O_RDONLY | O_DIRECTORY);
+  devfd = openat (rootfsfd, "dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
   if (UNLIKELY (devfd < 0))
     return crun_make_error (err, errno, "open /dev directory in `%s`", rootfs);
 
@@ -214,13 +250,13 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
     return ret;
   is_user_ns = ret;
 
-  ret = libcrun_create_dev (container, devfd, &kvm_device, is_user_ns, true, err);
+  ret = libcrun_create_dev (container, devfd, -1, &kvm_device, is_user_ns, true, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
   if (create_sev)
     {
-      ret = libcrun_create_dev (container, devfd, &sev_device, is_user_ns, true, err);
+      ret = libcrun_create_dev (container, devfd, -1, &sev_device, is_user_ns, true, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
@@ -229,22 +265,23 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
 }
 
 static int
-libkrun_load (void **cookie, libcrun_error_t *err arg_unused)
+libkrun_load (void **cookie, libcrun_error_t *err)
 {
   struct krun_config *kconf;
-  void *handle;
+  const char *libkrun_so = "libkrun.so.1";
+  const char *libkrun_sev_so = "libkrun-sev.so.1";
 
   kconf = malloc (sizeof (struct krun_config));
   if (kconf == NULL)
     return crun_make_error (err, 0, "could not allocate memory for krun_config");
 
-  kconf->handle = dlopen ("libkrun.so.1", RTLD_NOW);
-  kconf->handle_sev = dlopen ("libkrun-sev.so.1", RTLD_NOW);
+  kconf->handle = dlopen (libkrun_so, RTLD_NOW);
+  kconf->handle_sev = dlopen (libkrun_sev_so, RTLD_NOW);
 
   if (kconf->handle == NULL && kconf->handle_sev == NULL)
     {
       free (kconf);
-      return crun_make_error (err, 0, "could not allocate memory for krun_config");
+      return crun_make_error (err, 0, "failed to open `%s` and `%s` for krun_config", libkrun_so, libkrun_sev_so);
     }
 
   kconf->sev = false;
@@ -255,26 +292,101 @@ libkrun_load (void **cookie, libcrun_error_t *err arg_unused)
 }
 
 static int
-libkrun_unload (void *cookie, libcrun_error_t *err arg_unused)
+libkrun_unload (void *cookie, libcrun_error_t *err)
 {
   int r;
 
-  if (cookie)
+  struct krun_config *kconf = (struct krun_config *) cookie;
+  if (kconf != NULL)
     {
-      r = dlclose (cookie);
-      if (UNLIKELY (r < 0))
-        return crun_make_error (err, 0, "could not unload handle: %s", dlerror ());
+      if (kconf->handle != NULL)
+        {
+          r = dlclose (kconf->handle);
+          if (UNLIKELY (r != 0))
+            return crun_make_error (err, 0, "could not unload handle: `%s`", dlerror ());
+        }
+      if (kconf->handle_sev != NULL)
+        {
+          r = dlclose (kconf->handle_sev);
+          if (UNLIKELY (r != 0))
+            return crun_make_error (err, 0, "could not unload handle_sev: `%s`", dlerror ());
+        }
     }
+  return 0;
+}
+
+static runtime_spec_schema_defs_linux_device_cgroup *
+make_oci_spec_dev (const char *type, dev_t device, bool allow, const char *access)
+{
+  runtime_spec_schema_defs_linux_device_cgroup *dev = xmalloc0 (sizeof (*dev));
+
+  dev->allow = allow;
+  dev->allow_present = 1;
+
+  dev->type = xstrdup (type);
+
+  dev->major = major (device);
+  dev->major_present = 1;
+
+  dev->minor = minor (device);
+  dev->minor_present = 1;
+
+  dev->access = xstrdup (access);
+
+  return dev;
+}
+
+static int
+libkrun_modify_oci_configuration (void *cookie arg_unused, libcrun_context_t *context arg_unused,
+                                  runtime_spec_schema_config_schema *def,
+                                  libcrun_error_t *err)
+{
+  const size_t device_size = sizeof (runtime_spec_schema_defs_linux_device_cgroup);
+  struct stat st_kvm, st_sev;
+  bool has_sev = true;
+  size_t len;
+  int ret;
+
+  if (def->linux == NULL || def->linux->resources == NULL
+      || def->linux->resources->devices == NULL)
+    return 0;
+
+  /* Always allow the /dev/kvm device.  */
+
+  ret = stat ("/dev/kvm", &st_kvm);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "stat `/dev/kvm`");
+
+  ret = stat ("/dev/sev", &st_sev);
+  if (UNLIKELY (ret < 0))
+    {
+      if (errno != ENOENT)
+        return crun_make_error (err, errno, "stat `/dev/sev`");
+      has_sev = false;
+    }
+
+  len = def->linux->resources->devices_len;
+  def->linux->resources->devices = xrealloc (def->linux->resources->devices,
+                                             device_size * (len + 2 + (has_sev ? 1 : 0)));
+
+  def->linux->resources->devices[len] = make_oci_spec_dev ("a", st_kvm.st_rdev, true, "rwm");
+  if (has_sev)
+    def->linux->resources->devices[len + 1] = make_oci_spec_dev ("a", st_sev.st_rdev, true, "rwm");
+
+  def->linux->resources->devices_len += has_sev ? 2 : 1;
+
   return 0;
 }
 
 struct custom_handler_s handler_libkrun = {
   .name = "krun",
+  .alias = NULL,
   .feature_string = "LIBKRUN",
   .load = libkrun_load,
   .unload = libkrun_unload,
-  .exec_func = libkrun_exec,
+  .run_func = libkrun_exec,
   .configure_container = libkrun_configure_container,
+  .modify_oci_configuration = libkrun_modify_oci_configuration,
 };
 
 #endif
