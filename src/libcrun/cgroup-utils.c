@@ -65,17 +65,22 @@ libcrun_cgroups_create_symlinks (int dirfd, libcrun_error_t *err)
         {
           if (errno == ENOENT || errno == EEXIST)
             continue;
-          return crun_make_error (err, errno, "symlinkat %s", cgroup_symlinks[i].name);
+          return crun_make_error (err, errno, "symlinkat `%s`", cgroup_symlinks[i].name);
         }
     }
   return 0;
 }
 
 int
-make_cgroup_threaded (const char *path, libcrun_error_t *err)
+maybe_make_cgroup_threaded (const char *path, libcrun_error_t *err)
 {
   cleanup_free char *cgroup_path_type = NULL;
   const char *const threaded = "threaded";
+  cleanup_free char *content = NULL;
+  cleanup_free char *buffer = NULL;
+  const char *parent;
+  size_t size;
+  char *it;
   int ret;
 
   path = consume_slashes (path);
@@ -87,23 +92,29 @@ make_cgroup_threaded (const char *path, libcrun_error_t *err)
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = write_file (cgroup_path_type, threaded, strlen (threaded), err);
-  if (UNLIKELY (ret < 0 && errno == EOPNOTSUPP))
+  ret = read_all_file (cgroup_path_type, &content, &size, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (size > 0)
     {
-      cleanup_free char *buffer = xstrdup (path);
-      const char *parent = consume_slashes (dirname (buffer));
-      if (parent[0])
-        {
-          crun_error_release (err);
-
-          ret = make_cgroup_threaded (parent, err);
-          if (ret < 0)
-            return ret;
-
-          return write_file (cgroup_path_type, threaded, strlen (threaded), err);
-        }
+      it = content + size - 1;
+      while (*it == '\n' && it > content)
+        *it-- = '\0';
     }
-  return ret;
+
+  if (strcmp (content, "domain") == 0 || strcmp (content, "domain threaded") == 0)
+    return 0;
+
+  buffer = xstrdup (path);
+  parent = consume_slashes (dirname (buffer));
+  if (parent[0] && strcmp (parent, "."))
+    {
+      ret = maybe_make_cgroup_threaded (parent, err);
+      if (ret < 0)
+        return ret;
+    }
+  return write_file (cgroup_path_type, threaded, strlen (threaded), err);
 }
 
 int
@@ -138,7 +149,7 @@ move_process_to_cgroup (pid_t pid, const char *subsystem, const char *path, libc
 
           crun_error_release (err);
 
-          ret = make_cgroup_threaded (path, err);
+          ret = maybe_make_cgroup_threaded (path, err);
           if (UNLIKELY (ret < 0))
             return ret;
 
@@ -151,14 +162,14 @@ move_process_to_cgroup (pid_t pid, const char *subsystem, const char *path, libc
 }
 
 int
-libcrun_get_current_unified_cgroup (char **path, libcrun_error_t *err)
+libcrun_get_current_unified_cgroup (char **path, bool absolute, libcrun_error_t *err)
 {
   cleanup_free char *content = NULL;
   size_t content_size;
   char *from, *to;
   int ret;
 
-  ret = read_all_file ("/proc/self/cgroup", &content, &content_size, err);
+  ret = read_all_file (PROC_SELF_CGROUP, &content, &content_size, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -169,10 +180,14 @@ libcrun_get_current_unified_cgroup (char **path, libcrun_error_t *err)
   from += 3;
   to = strchr (from, '\n');
   if (UNLIKELY (to == NULL))
-    return crun_make_error (err, 0, "cannot parse /proc/self/cgroup");
+    return crun_make_error (err, 0, "cannot parse `%s`", PROC_SELF_CGROUP);
   *to = '\0';
 
-  return append_paths (path, err, CGROUP_ROOT, from, NULL);
+  if (absolute)
+    return append_paths (path, err, CGROUP_ROOT, from, NULL);
+
+  *path = xstrdup (from);
+  return 0;
 }
 
 #ifndef CGROUP2_SUPER_MAGIC
@@ -191,14 +206,14 @@ detect_cgroup_mode (libcrun_error_t *err)
 
   ret = statfs (CGROUP_ROOT, &stat);
   if (ret < 0)
-    return crun_make_error (err, errno, "statfs '" CGROUP_ROOT "'");
+    return crun_make_error (err, errno, "statfs `" CGROUP_ROOT "`");
   if (stat.f_type == CGROUP2_SUPER_MAGIC)
     return CGROUP_MODE_UNIFIED;
   if (stat.f_type != TMPFS_MAGIC)
-    return crun_make_error (err, 0, "invalid file system type on '" CGROUP_ROOT "'");
+    return crun_make_error (err, 0, "invalid file system type on `" CGROUP_ROOT "`");
   ret = statfs (CGROUP_ROOT "/unified", &stat);
   if (ret < 0 && errno != ENOENT)
-    return crun_make_error (err, errno, "statfs '" CGROUP_ROOT "/unified'");
+    return crun_make_error (err, errno, "statfs `" CGROUP_ROOT "/unified`");
   if (ret < 0)
     return CGROUP_MODE_LEGACY;
   return stat.f_type == CGROUP2_SUPER_MAGIC ? CGROUP_MODE_HYBRID : CGROUP_MODE_LEGACY;
@@ -407,7 +422,7 @@ libcrun_cgroup_read_pids_from_path (const char *path, bool recurse, pid_t **pids
       break;
 
     default:
-      return crun_make_error (err, 0, "invalid cgroup mode %d", mode);
+      return crun_make_error (err, 0, "invalid cgroup mode `%d`", mode);
     }
 
   dirfd = open (cgroup_path, O_DIRECTORY | O_CLOEXEC);
@@ -493,7 +508,7 @@ destroy_cgroup_path (const char *path, int mode, libcrun_error_t *err)
           char *saveptr;
           bool has_data;
 
-          ret = read_all_file ("/proc/self/cgroup", &content, &content_size, err);
+          ret = read_all_file (PROC_SELF_CGROUP, &content, &content_size, err);
           if (UNLIKELY (ret < 0))
             {
               if (crun_error_get_errno (err) == ENOENT)
@@ -569,7 +584,9 @@ chown_cgroups (const char *path, uid_t uid, gid_t gid, libcrun_error_t *err)
   if (UNLIKELY (ret < 0))
     return ret;
 
-  dfd = open (cgroup_path, O_PATH);
+  dfd = open (cgroup_path, O_CLOEXEC | O_PATH);
+  if (UNLIKELY (dfd < 0))
+    return crun_make_error (err, errno, "open `%s`", cgroup_path);
 
   ret = read_all_file ("/sys/kernel/cgroup/delegate", &delegate, &delegate_size, err);
   if (UNLIKELY (ret < 0))
@@ -664,7 +681,7 @@ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
       if (UNLIKELY (ret < 0))
         return ret;
 
-      ret = write_file_with_flags (kill_file, 0, "1", 1, err);
+      ret = write_file_at_with_flags (AT_FDCWD, 0, 0700, kill_file, "1", 1, err);
       if (ret >= 0)
         return 0;
 
@@ -689,7 +706,7 @@ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
     {
       ret = kill (pids[i], signal);
       if (UNLIKELY (ret < 0 && errno != ESRCH))
-        return crun_make_error (err, errno, "kill process %d", pids[i]);
+        return crun_make_error (err, errno, "kill process `%d`", pids[i]);
     }
 
   ret = libcrun_cgroup_pause_unpause_path (path, false, err);
@@ -702,26 +719,20 @@ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
 static int
 read_available_controllers (const char *path, libcrun_error_t *err)
 {
-  cleanup_close int fd;
+  cleanup_free char *controllers = NULL;
+  cleanup_free char *buf = NULL;
   char *saveptr = NULL;
   const char *token;
-  char *controllers;
   int available = 0;
-  char buf[256];
   ssize_t ret;
 
   ret = append_paths (&controllers, err, CGROUP_ROOT, path, "cgroup.controllers", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  fd = TEMP_FAILURE_RETRY (open (controllers, O_RDONLY | O_CLOEXEC));
-  if (UNLIKELY (fd < 0))
-    return crun_make_error (err, errno, "error opening file `%s`", path);
-
-  ret = TEMP_FAILURE_RETRY (read (fd, buf, sizeof (buf) - 1));
+  ret = read_all_file (controllers, &buf, NULL, err);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "error reading from file `%s`", path);
-  buf[ret] = '\0';
+    return crun_make_error (err, errno, "error reading from file `%s`", controllers);
 
   for (token = strtok_r (buf, " \n", &saveptr); token; token = strtok_r (NULL, " \n", &saveptr))
     {
@@ -737,6 +748,8 @@ read_available_controllers (const char *path, libcrun_error_t *err)
         available |= CGROUP_PIDS;
       else if (strcmp (token, "io") == 0)
         available |= CGROUP_IO;
+      else if (strcmp (token, "misc") == 0)
+        available |= CGROUP_MISC;
     }
   return available;
 }
@@ -750,10 +763,11 @@ write_controller_file (const char *path, int controllers_to_enable, libcrun_erro
   int ret;
 
   controllers_len = xasprintf (
-      &controllers, "%s %s %s %s %s %s", (controllers_to_enable & CGROUP_CPU) ? "+cpu" : "",
+      &controllers, "%s %s %s %s %s %s %s", (controllers_to_enable & CGROUP_CPU) ? "+cpu" : "",
       (controllers_to_enable & CGROUP_IO) ? "+io" : "", (controllers_to_enable & CGROUP_MEMORY) ? "+memory" : "",
       (controllers_to_enable & CGROUP_PIDS) ? "+pids" : "", (controllers_to_enable & CGROUP_CPUSET) ? "+cpuset" : "",
-      (controllers_to_enable & CGROUP_HUGETLB) ? "+hugetlb" : "");
+      (controllers_to_enable & CGROUP_HUGETLB) ? "+hugetlb" : "",
+      (controllers_to_enable & CGROUP_MISC) ? "+misc" : "");
 
   ret = append_paths (&subtree_control, err, CGROUP_ROOT, path, "cgroup.subtree_control", NULL);
   if (UNLIKELY (ret < 0))
@@ -769,7 +783,7 @@ write_controller_file (const char *path, int controllers_to_enable, libcrun_erro
 
       e = crun_error_get_errno (err);
       if (e != EPERM && e != EACCES && e != EBUSY && e != ENOENT && e != EOPNOTSUPP)
-        return ret;
+        return crun_error_wrap (err, "enable controllers `%s`", controllers);
 
       /* ENOENT can mean both that the file doesn't exist or the controller is not present.  */
       if (e == ENOENT)
@@ -789,6 +803,13 @@ write_controller_file (const char *path, int controllers_to_enable, libcrun_erro
         }
 
       crun_error_release (err);
+
+      if (e == EOPNOTSUPP)
+        {
+          ret = maybe_make_cgroup_threaded (path, err);
+          if (UNLIKELY (ret < 0))
+            return crun_error_wrap (err, "make cgroup threaded");
+        }
 
       /* It seems the kernel can return EBUSY when a process was moved to a sub-cgroup
          and the controllers are enabled in its parent cgroup.  Retry a few times when
@@ -813,14 +834,6 @@ write_controller_file (const char *path, int controllers_to_enable, libcrun_erro
 
                   if (e == EBUSY)
                     repeat = true;
-                  else if (e == EOPNOTSUPP)
-                    {
-                      ret = make_cgroup_threaded (path, err);
-                      if (UNLIKELY (ret < 0))
-                        return ret;
-
-                      repeat = true;
-                    }
 
                   continue;
                 }
@@ -952,7 +965,7 @@ libcrun_get_cgroup_dirfd (struct libcrun_cgroup_status *status, const char *sub_
   if (UNLIKELY (ret < 0))
     return ret;
 
-  cgroupdirfd = open (path_to_cgroup, O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY | O_RDONLY);
+  cgroupdirfd = open (path_to_cgroup, O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY | O_PATH);
   if (UNLIKELY (cgroupdirfd < 0))
     return crun_make_error (err, errno, "open `%s`", path_to_cgroup);
 

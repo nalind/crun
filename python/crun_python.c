@@ -69,7 +69,7 @@ free_container (PyObject *ptr)
 }
 
 static PyObject *
-container_load_from_file (PyObject *self, PyObject *args)
+container_load_from_file (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   const char *path;
@@ -86,7 +86,7 @@ container_load_from_file (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_load_from_memory (PyObject *self, PyObject *args)
+container_load_from_memory (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   const char *def;
@@ -114,14 +114,14 @@ free_context (void *ptr)
 }
 
 static PyObject *
-make_context (PyObject *self, PyObject *args, PyObject *kwargs)
+make_context (PyObject *self arg_unused, PyObject *args, PyObject *kwargs)
 {
   char *id = NULL;
   char *bundle = NULL;
   char *state_root = NULL;
   char *notify_socket = NULL;
   static char *kwlist[] =
-    { "id", "bundle", "state-root", "systemd-cgroup", "notify-socket", "detach", NULL };
+    { "id", "bundle", "state_root", "systemd_cgroup", "notify_socket", "detach", "no_new_keyring", "force_no_cgroup", "no_pivot", NULL };
   libcrun_context_t *ctx = malloc (sizeof (*ctx));
   if (ctx == NULL)
     return NULL;
@@ -130,8 +130,8 @@ make_context (PyObject *self, PyObject *args, PyObject *kwargs)
   ctx->fifo_exec_wait_fd = -1;
 
   if (!PyArg_ParseTupleAndKeywords
-      (args, kwargs, "s|ssbsb", kwlist, &id, &bundle, &state_root,
-       &ctx->systemd_cgroup, &notify_socket, &ctx->detach))
+      (args, kwargs, "s|ssbsbbbb", kwlist, &id, &bundle, &state_root,
+       &ctx->systemd_cgroup, &notify_socket, &ctx->detach, &ctx->no_new_keyring, &ctx->force_no_cgroup, &ctx->no_pivot))
     return NULL;
 
   ctx->id = xstrdup (id);
@@ -142,7 +142,7 @@ make_context (PyObject *self, PyObject *args, PyObject *kwargs)
 }
 
 static PyObject *
-container_run (PyObject *self, PyObject *args)
+container_run (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -172,7 +172,7 @@ container_run (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_create (PyObject *self, PyObject *args)
+container_create (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -193,7 +193,7 @@ container_create (PyObject *self, PyObject *args)
     return NULL;
 
   Py_BEGIN_ALLOW_THREADS;
-  ret = libcrun_container_create (ctx, ctr, LIBCRUN_RUN_OPTIONS_PREFORK, &err);
+  ret = libcrun_container_create (ctx, ctr, LIBCRUN_CREATE_OPTIONS_PREFORK, &err);
   Py_END_ALLOW_THREADS;
   if (ret < 0)
     return set_error (&err);
@@ -202,7 +202,7 @@ container_create (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_delete (PyObject *self, PyObject *args)
+container_delete (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -228,7 +228,7 @@ container_delete (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_kill (PyObject *self, PyObject *args)
+container_kill (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -254,7 +254,7 @@ container_kill (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_start (PyObject *self, PyObject *args)
+container_start (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -279,7 +279,7 @@ container_start (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-containers_list (PyObject *self, PyObject *args)
+containers_list (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -320,7 +320,7 @@ containers_list (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_status (PyObject *self, PyObject *args)
+container_status (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -373,7 +373,7 @@ load_json_file (yajl_val *out, const char *jsondata, struct parser_context *ctx 
 }
 
 static PyObject *
-container_update (PyObject *self, PyObject *args)
+container_update (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -420,7 +420,7 @@ container_update (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-container_spec (PyObject *self, PyObject *args)
+container_spec (PyObject *self arg_unused, PyObject *args arg_unused)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -448,7 +448,7 @@ container_spec (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-get_verbosity (PyObject *self, PyObject *args)
+get_verbosity (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -462,7 +462,7 @@ get_verbosity (PyObject *self, PyObject *args)
 }
 
 static PyObject *
-set_verbosity (PyObject *self, PyObject *args)
+set_verbosity (PyObject *self arg_unused, PyObject *args)
 {
   libcrun_error_t err;
   PyObject *ctx_obj = NULL;
@@ -482,7 +482,7 @@ static PyMethodDef CrunMethods[] = {
   {"load_from_memory", container_load_from_memory, METH_VARARGS,
    "Load an OCI container from memory."},
   {"run", container_run, METH_VARARGS, "Run a container."},
-  {"create", container_run, METH_VARARGS, "Create a container."},
+  {"create", container_create, METH_VARARGS, "Create a container."},
   {"delete", container_delete, METH_VARARGS, "Delete a container."},
   {"kill", container_kill, METH_VARARGS, "Kill a container."},
   {"list", containers_list, METH_VARARGS, "List the containers."},
@@ -519,5 +519,6 @@ PyInit_python_crun (void)
     return ret;
   (void) PyModule_AddIntConstant (ret, "VERBOSITY_ERROR", LIBCRUN_VERBOSITY_ERROR);
   (void) PyModule_AddIntConstant (ret, "VERBOSITY_WARNING", LIBCRUN_VERBOSITY_WARNING);
+  (void) PyModule_AddIntConstant (ret, "VERBOSITY_DEBUG", LIBCRUN_VERBOSITY_DEBUG);
   return ret;
 }

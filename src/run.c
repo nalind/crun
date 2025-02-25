@@ -37,10 +37,13 @@ enum
   OPTION_NO_SUBREAPER,
   OPTION_NO_NEW_KEYRING,
   OPTION_PRESERVE_FDS,
-  OPTION_NO_PIVOT
+  OPTION_NO_PIVOT,
+  OPTION_KEEP,
 };
 
 static const char *bundle = NULL;
+
+static bool keep = false;
 
 static libcrun_context_t crun_context;
 
@@ -52,7 +55,8 @@ static struct argp_option options[]
           "path to a socket that will receive the ptmx end of the tty", 0 },
         { "preserve-fds", OPTION_PRESERVE_FDS, "N", 0, "pass additional FDs to the container", 0 },
         { "pid-file", OPTION_PID_FILE, "FILE", 0, "where to write the PID of the container", 0 },
-        { "no-subreaper", OPTION_NO_SUBREAPER, 0, 0, "do not create a subreaper process", 0 },
+        { "keep", OPTION_KEEP, 0, 0, "do not delete the container after it exits", 0 },
+        { "no-subreaper", OPTION_NO_SUBREAPER, 0, 0, "do not create a subreaper process (ignored)", 0 },
         { "no-new-keyring", OPTION_NO_NEW_KEYRING, 0, 0, "keep the same session key", 0 },
         { "no-pivot", OPTION_NO_PIVOT, 0, 0, "do not use pivot_root", 0 },
         {
@@ -80,16 +84,19 @@ parse_opt (int key, char *arg, struct argp_state *state)
       bundle = crun_context.bundle = argp_mandatory_argument (arg, state);
       break;
 
+    case OPTION_KEEP:
+      keep = true;
+      break;
+
     case OPTION_CONSOLE_SOCKET:
       crun_context.console_socket = argp_mandatory_argument (arg, state);
       break;
 
     case OPTION_PRESERVE_FDS:
-      crun_context.preserve_fds = strtoll (argp_mandatory_argument (arg, state), NULL, 10);
+      crun_context.preserve_fds = parse_int_or_fail (argp_mandatory_argument (arg, state), "preserve-fds");
       break;
 
     case OPTION_NO_SUBREAPER:
-      crun_context.no_subreaper = true;
       break;
 
     case OPTION_NO_NEW_KEYRING:
@@ -126,8 +133,6 @@ crun_command_run (struct crun_global_arguments *global_args, int argc, char **ar
 
   crun_context.preserve_fds = 0;
   crun_context.listen_fds = 0;
-  /* Check if global handler is configured and pass it down to crun context */
-  crun_context.handler = global_args->handler;
 
   argp_parse (&run_argp, argc, argv, ARGP_IN_ORDER, &first_arg, &crun_context);
   crun_assert_n_args (argc - first_arg, 1, 1);
@@ -172,9 +177,9 @@ crun_command_run (struct crun_global_arguments *global_args, int argc, char **ar
   crun_context.bundle = bundle;
   if (getenv ("LISTEN_FDS"))
     {
-      crun_context.listen_fds = strtoll (getenv ("LISTEN_FDS"), NULL, 10);
+      crun_context.listen_fds = parse_int_or_fail (getenv ("LISTEN_FDS"), "LISTEN_FDS");
       crun_context.preserve_fds += crun_context.listen_fds;
     }
 
-  return libcrun_container_run (&crun_context, container, 0, err);
+  return libcrun_container_run (&crun_context, container, keep ? LIBCRUN_RUN_OPTIONS_KEEP : 0, err);
 }

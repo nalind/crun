@@ -22,6 +22,8 @@ import os
 import tempfile
 import subprocess
 
+default_umask = 0o22
+
 base_conf = """
 {
     "ociVersion": "1.0.0",
@@ -143,7 +145,7 @@ def parse_proc_status(content):
         r[k] = v.strip()
     return r
 
-def add_all_namespaces(conf, cgroupns=False, userns=False, netns=True, ipcns=True, utsns=True, pidns=True):
+def add_all_namespaces(conf, cgroupns=False, userns=False, netns=True, ipcns=True, utsns=True, pidns=True,time=False):
     has = {}
     for i in conf['linux']['namespaces']:
         has[i['type']] = i['type']
@@ -160,6 +162,8 @@ def add_all_namespaces(conf, cgroupns=False, userns=False, netns=True, ipcns=Tru
         namespaces = namespaces + ["user"]
     if netns:
         namespaces = namespaces + ["network"]
+    if time:
+        namespaces = namespaces + ["time"]
     for i in namespaces:
         if i not in has:
             conf['linux']['namespaces'].append({"type" : i})
@@ -196,14 +200,18 @@ def get_tests_root():
 def get_tests_root_status():
     return os.path.join(get_tests_root(), "root")
 
+def get_init_path():
+    return os.path.abspath(os.getenv("INIT") or "tests/init")
+
 def get_crun_path():
     cwd = os.getcwd()
     return os.getenv("OCI_RUNTIME") or os.path.join(cwd, "crun")
 
 def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
+                       keep=False,
                        command='run', env=None, use_popen=False, hide_stderr=False, cgroup_manager='cgroupfs',
                        all_dev_null=False, id_container=None, relative_config_path="config.json",
-                       chown_rootfs_to=None):
+                       chown_rootfs_to=None, callback_prepare_rootfs=None):
 
     # Some tests require that the container user, which might not be the
     # same user as the person running the tests, is able to resolve the full path
@@ -232,7 +240,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
         conf = json.dumps(config)
         config_file.write(conf)
 
-    init = os.getenv("INIT") or "tests/init"
+    init = get_init_path()
     crun = get_crun_path()
 
     os.makedirs(os.path.join(rootfs, "sbin"))
@@ -255,13 +263,17 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
             for f in dirs + files:
                 os.chown(os.path.join(root, f), chown_rootfs_to, chown_rootfs_to, follow_symlinks=False)
 
+    if callback_prepare_rootfs is not None:
+        callback_prepare_rootfs(rootfs)
+
     detach_arg = ['--detach'] if detach else []
+    keep_arg = ['--keep'] if keep else []
     preserve_fds_arg = ['--preserve-fds', str(preserve_fds)] if preserve_fds else []
     pid_file_arg = ['--pid-file', pid_file] if pid_file else []
     relative_config_path = ['--config', relative_config_path] if relative_config_path else []
 
     root = get_tests_root_status()
-    args = [crun, "--cgroup-manager", cgroup_manager, "--root", root, command] + relative_config_path + preserve_fds_arg + detach_arg + pid_file_arg + [id_container]
+    args = [crun, "--cgroup-manager", cgroup_manager, "--root", root, command] + relative_config_path + preserve_fds_arg + detach_arg + keep_arg + pid_file_arg + [id_container]
 
     stderr = subprocess.STDOUT
     if hide_stderr:
@@ -277,11 +289,13 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     if use_popen:
         if not stdout:
             stdout=subprocess.PIPE
-        return subprocess.Popen(args, cwd=temp_dir, stdout=stdout,
+        return subprocess.Popen(args, cwd=temp_dir,
+                                umask=default_umask,
+                                stdout=stdout,
                                 stderr=stderr, stdin=stdin, env=env,
                                 close_fds=False), id_container
     else:
-        return subprocess.check_output(args, cwd=temp_dir, stderr=stderr, env=env, close_fds=False).decode(), id_container
+        return subprocess.check_output(args, cwd=temp_dir, stderr=stderr, env=env, close_fds=False, umask=default_umask).decode(), id_container
 
 def run_crun_command(args):
     root = get_tests_root_status()

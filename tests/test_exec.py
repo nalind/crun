@@ -21,6 +21,7 @@ import re
 import shutil
 import tempfile
 from tests_utils import *
+import time
 
 def test_exec():
     conf = base_config()
@@ -35,6 +36,41 @@ def test_exec():
     finally:
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
+    return 0
+
+def test_uid_tty():
+    # we need at least two uids
+    if is_rootless():
+        return 77
+
+    if os.isatty(1) == False:
+        return 77
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    conf['process']['terminal'] = True
+    add_all_namespaces(conf)
+    cid = None
+    ret = 1
+    try:
+        cid = "container-%s" % os.getpid()
+        proc = run_and_get_output(conf, command='run', id_container=cid, use_popen=True)
+        for i in range(0, 500):
+            try:
+                out = run_crun_command(["exec", "-t", "--user", "1", cid, "/init", "owner", "/proc/self/fd/0"])
+                if "1:" in out:
+                    ret = 0
+                    break
+            except:
+                pass
+            time.sleep(0.01)
+        return ret
+    finally:
+        if cid is not None:
+            try:
+                run_crun_command(["delete", "-f", cid])
+            except:
+                pass
     return 0
 
 def test_exec_root_netns_with_userns():
@@ -324,7 +360,7 @@ def test_exec_write_pid_file():
         if not os.path.exists(pid_file):
             return -1
 
-        regu_cont = re.compile(r'\d{5}')
+        regu_cont = re.compile(r'\d+')
         with open(pid_file, 'r') as fp:
             contents = fp.read()
             fp.close()
@@ -334,6 +370,98 @@ def test_exec_write_pid_file():
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
         shutil.rmtree(tempdir)
+    return 0
+
+def test_exec_cpu_affinity():
+    if len(os.sched_getaffinity(0)) < 4:
+        return 77
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    cid = None
+    tempdir = tempfile.mkdtemp()
+
+    def cpu_mask_from_proc_status(status):
+        for l in status.split("\n"):
+            parts = l.split(":")
+            if parts[0] == "Cpus_allowed_list":
+                return parts[1].strip()
+        return ""
+
+    def exec_and_get_affinity_mask(cid, exec_cpu_affinity=None):
+        process_file = os.path.join(tempdir, "process.json")
+        with open(process_file, "w") as f:
+            process = {
+	        "user": {
+	            "uid": 0,
+	            "gid": 0
+	        },
+                "terminal": False,
+                "cwd" : "/",
+	        "args": [
+                    "/init",
+                    "cat",
+                    "/proc/self/status"
+	        ]
+            }
+            if exec_cpu_affinity is not None:
+                process["execCPUAffinity"] = exec_cpu_affinity
+            json.dump(process, f)
+
+        out = run_crun_command(["exec", "--process", process_file, cid])
+        return cpu_mask_from_proc_status(out)
+
+    try:
+        with open("/proc/self/status") as f:
+            current_cpu_mask = cpu_mask_from_proc_status(f.read())
+        _, cid = run_and_get_output(conf, command='run', detach=True)
+
+        mask = exec_and_get_affinity_mask(cid)
+        if mask != current_cpu_mask:
+            sys.stderr.write("current cpu mask %s != %s\n" % (current_cpu_mask, mask))
+            return -1
+
+        mask = exec_and_get_affinity_mask(cid, {"initial" : "0-1"})
+        if mask != "0-1":
+            sys.stderr.write("cpu mask %s != 0-1\n" % mask)
+            return -1
+
+        mask = exec_and_get_affinity_mask(cid, {"final" : "0-2"})
+        if mask != "0-2":
+            sys.stderr.write("cpu mask %s != 0-2\n" % mask)
+            return -1
+
+        mask = exec_and_get_affinity_mask(cid, {"initial" : "1", "final" : "0-3"})
+        if mask != "0-3":
+            sys.stderr.write("cpu mask %s != 0-2\n" % mask)
+            return -1
+        return 0
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+        shutil.rmtree(tempdir)
+    return 0
+
+def test_exec_getpgrp():
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'pause']
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, command='run', detach=True)
+        for terminal in [True, False]:
+            if terminal and os.isatty(1) == False:
+                continue
+            cmdline = ["exec", "-t" if terminal else None, cid, "/init", "getpgrp"]
+            out = run_crun_command([x for x in cmdline if x is not None])
+            pgrp = int(out.split("\n")[0])
+            if pgrp <= 0:
+                sys.stderr.write("invalid pgrp, got %d\n" % pgrp)
+                return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
     return 0
 
 all_tests = {
@@ -348,6 +476,9 @@ all_tests = {
     "exec_add_no_new_privileges" : test_exec_no_new_privs,
     "exec_write_pid_file" : test_exec_write_pid_file,
     "exec_populate_home_env_from_process_uid" : test_exec_populate_home_env_from_process_uid,
+    "exec-test-uid-tty": test_uid_tty,
+    "exec-cpu-affinity": test_exec_cpu_affinity,
+    "exec-getpgrp": test_exec_getpgrp,
 }
 
 if __name__ == "__main__":
